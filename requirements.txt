@@ -1,0 +1,4 @@
+# Core dependencies (none - uses stdlib only)
+
+# Optional: HTTP/2 support (required for --http2 and --scan-type h2)
+h2>=4.0.0

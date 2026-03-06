@@ -152,3 +152,7 @@ cython_debug/
 
 # Smuggler results
 payloads/*.txt
+tests/req3.txt
+tests/req1.txt
+tests/req2.txt
+tests/baseline_test.txt

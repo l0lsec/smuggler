@@ -28,6 +28,35 @@ EndChunk = "0\r\n\r\n"
 def Chunked(data):
 	return hex(len(data))[2:]+RN+data+RN
 
+def ChunkedExt(data, ext=""):
+	return hex(len(data))[2:]+ext+RN+data+RN
+
+def EndChunkExt(ext=""):
+	return "0"+ext+RN+RN
+
+def EndChunkBareLF():
+	return "0\n\n"
+
+def ChunkedBareLF(data):
+	return hex(len(data))[2:]+"\n"+data+"\n"
+
+def EndChunkBareCR():
+	return "0\r\r"
+
+class RawPayload():
+	def __init__(self):
+		self.data = b""
+
+	def __str__(self):
+		if isinstance(self.data, bytes):
+			return self.data.decode('latin-1')
+		return self.data
+
+	def to_bytes(self):
+		if isinstance(self.data, str):
+			return self.data.encode('latin-1')
+		return self.data
+
 class Payload():
 	def __init__(self, host=None):
 		self.header = None
