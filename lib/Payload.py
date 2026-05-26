@@ -93,10 +93,6 @@ class Payload():
 		return (result)
 		
 	def __setattr__(self, name, value):
-		if name == "body" and (type("string") != type(value) and value != None):
-			raise AttributeError("Only string types allowed")
-		if name == "header" and (type("string") != type(value) and value != None):
-			raise AttributeError("Only string types allowed")
-		if name == "host" and (type("string") != type(value) and value != None):
-			raise AttributeError("Only string types allowed")
+		if name in ("body", "header", "host") and value is not None and not isinstance(value, str):
+			raise AttributeError("Only string types allowed for %s" % name)
 		self.__dict__[name] = value

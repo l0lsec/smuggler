@@ -200,11 +200,92 @@ specify configuration files using the -c/--configfile \<configfile> command line
 Inside the Smuggler directory is the payloads directory. When Smuggler finds a potential CLTE or TECL desync issue, it will automatically dump a binary txt file of the problematic payload in the payloads directory. All payload filenames are annotated with the hostname, desync type and mutation type. Use these payloads to netcat directly to the server or to import into other analysis tools.
 
 ## Test Files
-The `tests/` directory contains example request files that can be used with the new request file functionality:
-- `req1.txt`, `req2.txt`, `req3.txt` - Example HTTP request files for testing
-- `baseline_test.txt` - Example baseline request file for comparison testing
 
-These files demonstrate the proper format for custom request files and can be used as templates for your own testing scenarios.
+The `tests/` directory contains example request files. **They are NOT
+interchangeable — the right file depends on the mode you're invoking.**
+
+| File | Intended mode | What it is |
+| --- | --- | --- |
+| `req_clean.txt` | `-r` (scan mode) | A vanilla GET. Smuggler extracts only the target (method/endpoint/host/cookies) and synthesizes its own smuggling payloads from the chosen config. **This is what most users want.** |
+| `req_poc.txt` | `-r --replay` | A deliberate CL.TE-style smuggling POC. Sent verbatim by `--replay`; useless as a scan template (body and embedded request line are ignored in scan mode). |
+| `req1.txt`, `req2.txt`, `req3.txt` | `-r --replay` (legacy) | Pre-existing POC-shaped examples. The new scan-mode validator will warn you if you pass these without `--replay`. |
+| `baseline_test.txt` | `--baseline-request` | Sample baseline used in conjunction with a smuggling POC during `--replay`. |
+
+### Why the distinction matters
+
+In scan mode the request file is **only a template**. Smuggler reads:
+
+- `method`, `endpoint`, `host`, `cookies`
+
+…and ignores everything else (body, extra headers, embedded request lines).
+Smuggling payloads are synthesized from the config (`configs/default.py`
+etc.) and from the scanner classes themselves. Pasting a Burp POC into
+`-r` *without* `--replay` will not send the POC on the wire.
+
+The tool now emits a `Notice:` warning when it detects body bytes or
+POC-shaped content in a scan-mode request file, with a hint to use
+`--replay` or `--baseline-request` instead.
+
+### `--baseline-request` requirements
+
+The baseline request is sent verbatim alongside (after) the smuggling
+request for differential analysis. It must be a **clean, well-formed
+request**. The validator emits warnings for baseline files too,
+regardless of mode, since a POC-shaped baseline produces a meaningless
+comparison.
+
+## Detection Capability Matrix
+
+The table below maps each attack class to the scanner that implements it,
+its oracle type, and the confidence you can place in a positive finding.
+
+| Attack class | Scanner (`--scan-type`) | Oracle | Confidence |
+| --- | --- | --- | --- |
+| TE.CL / CL.TE | `tecl`, `clte` (default) | Timing anomaly + positive gadget-smuggle probe (when the smuggled `GET /robots.txt` surfaces on a victim request) | High when both signals fire; medium on timing alone |
+| CL.0 / 0.CL | `cl0` | Pipelined victim request observes the smuggled gadget; tries the user's method + GET + POST | High (3-of-5 confirmations required) |
+| TE.0 | `te0` | Pipelined victim request observes the smuggled gadget after a zero-chunk terminator | High (3-of-5) |
+| Bare-LF / Bare-CR chunked | `bare-lf` | Pipelined victim observes the smuggled prefix when chunk framing uses bare LF/CR | High (3-of-5) |
+| Pause-based desync | `pause` | Send headers, pause N s, send body; pipelined victim observes smuggled prefix | Medium-high (2-of-3); pause length tunable with `--pause-timeout` |
+| Connection-state attack | `connection-state` | Pipelined `bad-Host` request returns a different status than a same request on a fresh connection | Medium; confirmed via second pipeline |
+| Parser discrepancy | `parser-discrepancy` | Per-technique control + canary probe; only flags when the technique alone matches baseline but the canary diverges | Medium-high (now resistant to malformed-technique false positives) |
+| Header removal (Keep-Alive) | `header-removal` | Matched-pair comparison of harmless vs attack request; requires 3 of 5 reproducible divergences | Medium-high |
+| Expect-based desync | `expect` | Multiple Expect variants pipelined with a victim; same gadget oracle as CL.0 | High when confirmed |
+| Hop-by-hop auth bypass | `hop-by-hop` | Baseline vs `Connection: <header>` probe; status flip confirmed 2-of-3 | High when reproducible |
+| HTTP/2 downgrade | `h2` (or `--http2`) | Sends the H2 attack stream, then opens a parallel H1 connection and checks whether the victim received the gadget response | High (was previously low/wrong - see "HTTP/2 oracle" below) |
+
+### HTTP/2 oracle
+
+Earlier versions inspected the H2 response stream itself for gadget tokens
+(`llow:`, `robots`). That cannot work in principle: a smuggled HTTP/1.1
+prefix only manifests on the *backend's next request*, never on the H2
+stream that carried it. The current implementation sends a follow-up H1
+victim request on a parallel connection and only flags when the victim
+response leaks the gadget. This eliminates a large class of both false
+positives (matched on benign body text) and false negatives (real desyncs
+that produced an innocuous H2 response).
+
+### Caveat for `--persistent-connection`
+
+When this flag is set, an anomalous mutation will reset the persistent
+TCP connection automatically (any timeout, disconnect, or socket error
+forces a reconnect). This stops the previous bug where a desync on
+mutation N produced cascading false positives on mutation N+1.
+
+## Tests
+
+The `tests/` directory now contains a unit-test harness in addition to
+example request files:
+
+```bash
+pip install -r requirements.txt
+python -m pytest tests/ -v
+```
+
+`tests/mock_server.py` provides a pluggable HTTP/1.1 server that
+simulates each HRS class; `tests/test_scans.py` runs positive + negative
+cases against every advanced scanner; `tests/test_recv_multiple.py` and
+`tests/test_replay_rewrite.py` are regression coverage for the response
+splitter and the replay-mode request rewriter.
 
 ## Helper Scripts
 After you find a desync issue feel free to use my Turbo Intruder desync scripts found Here: https://github.com/defparam/tiscripts

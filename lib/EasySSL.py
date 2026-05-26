@@ -185,16 +185,80 @@ class EasySSL():
 		return data if data else None
 
 	def recv_multiple(self, count, timeout=5.0):
+		"""Receive `count` HTTP/1.x responses framed by Content-Length or
+		Transfer-Encoding: chunked. We walk the byte stream rather than
+		string-splitting on "HTTP/" -- bodies and chunked fragments routinely
+		contain that literal, which caused false splits in the previous
+		implementation."""
 		responses = []
 		raw = self.recv_all(timeout)
 		if raw is None:
 			return responses
-		raw_str = raw.decode('latin-1', errors='replace')
-		parts = raw_str.split("HTTP/")
-		for i, part in enumerate(parts):
-			if i == 0 and not part:
-				continue
-			responses.append("HTTP/" + part)
+		offset = 0
+		total = len(raw)
+		for _ in range(count):
+			if offset >= total:
+				break
+			hdr_end = raw.find(b"\r\n\r\n", offset)
+			if hdr_end < 0:
+				# Trailing partial; treat the remainder as one response.
+				responses.append(raw[offset:].decode('latin-1', errors='replace'))
+				offset = total
+				break
+			headers_blob = raw[offset:hdr_end]
+			body_start = hdr_end + 4
+
+			# Default framing: read to end of buffer.
+			body_end = total
+
+			# Lowercase header copy for matching only.
+			hdr_lower = headers_blob.lower()
+			cl_idx = hdr_lower.find(b"content-length:")
+			te_chunked = b"transfer-encoding:" in hdr_lower and b"chunked" in hdr_lower
+
+			if te_chunked:
+				# Walk chunks: <size-hex>\r\n<data>\r\n ... 0\r\n\r\n
+				cur = body_start
+				while cur < total:
+					line_end = raw.find(b"\r\n", cur)
+					if line_end < 0:
+						break
+					size_token = raw[cur:line_end].split(b";", 1)[0].strip()
+					try:
+						chunk_size = int(size_token, 16)
+					except ValueError:
+						break
+					cur = line_end + 2
+					if chunk_size == 0:
+						# Skip optional trailers up to final CRLF.
+						trail_end = raw.find(b"\r\n\r\n", cur - 2)
+						if trail_end >= 0:
+							cur = trail_end + 4
+						else:
+							cur = total
+						break
+					cur += chunk_size + 2  # data + trailing CRLF
+				body_end = min(cur, total)
+			elif cl_idx >= 0:
+				cl_line_end = hdr_lower.find(b"\r\n", cl_idx)
+				if cl_line_end < 0:
+					# Content-Length is the final header in headers_blob, so
+					# there's no trailing \r\n inside the slice -- read to
+					# the end. (The old `[a:-1]` slice silently dropped the
+					# last digit, e.g. parsing "34" as "3".)
+					cl_line_end = len(hdr_lower)
+				cl_value = hdr_lower[cl_idx + len(b"content-length:"):cl_line_end].strip()
+				try:
+					cl = int(cl_value)
+					body_end = min(body_start + cl, total)
+				except ValueError:
+					body_end = total
+			else:
+				# No framing info: assume single response fills the rest.
+				body_end = total
+
+			responses.append(raw[offset:body_end].decode('latin-1', errors='replace'))
+			offset = body_end
 		return responses
 
 	# recv_web is an HTTP response parser. This parser has been hacked together and probably doesn't conform to RFC

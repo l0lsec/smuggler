@@ -37,7 +37,11 @@ from datetime import datetime
 from lib.Payload import Payload, Chunked, EndChunk, RawPayload
 from lib.EasySSL import EasySSL
 from lib.colorama import Fore, Style
-from lib.Scans import ALL_SCANS, ScanCL0, ScanPauseDesync, ScanConnectionState, ScanParserDiscrepancy, ScanHeaderRemoval, ScanExpectDesync
+from lib.Scans import (
+	ALL_SCANS, ScanCL0, ScanPauseDesync, ScanConnectionState,
+	ScanParserDiscrepancy, ScanHeaderRemoval, ScanExpectDesync,
+	ScanTE0, ScanBareLFChunked, ScanHopByHop,
+)
 from urllib.parse import urlparse
 
 try:
@@ -47,35 +51,59 @@ except ImportError:
 	H2_SCAN_AVAILABLE = False
 
 class Desyncr():
-	def __init__(self, configfile, smhost, smport=443, url="", method="POST", endpoint="/",  SSLFlag=False, logh=None, smargs=None, custom_request=None):
+	def __init__(self, configfile, smhost, smport=443, url="", method="POST", endpoint="/",
+			SSLFlag=False, logh=None, custom_request=None,
+			vhost="", timeout=5.0, quiet=False, exit_early=False,
+			proxy=None, cookies_str=None, persistent_connection=False):
 		self._configfile = configfile
 		self._host = smhost
 		self._port = smport
 		self._method = method
 		self._endpoint = endpoint
-		self._vhost = smargs.vhost
+		self._vhost = vhost or ""
 		self._url = url
-		self._timeout = float(smargs.timeout)
+		self._timeout = float(timeout)
 		self.ssl_flag = SSLFlag
 		self._logh = logh
-		self._quiet = smargs.quiet
-		self._exit_early = smargs.exit_early
-		self._attempts = 0
+		self._quiet = quiet
+		self._exit_early = exit_early
 		self._cookies = []
-		self._proxy = getattr(smargs, 'proxy', None)
+		self._proxy = proxy
 		self._custom_request = custom_request
-		self._persistent_connection = getattr(smargs, 'persistent_connection', False)
+		self._persistent_connection = persistent_connection
 		self._web_connection = None
-		
-		# Add cookies from custom request file if provided
+
 		if custom_request and 'cookies' in custom_request and custom_request['cookies']:
 			self._cookies.extend(custom_request['cookies'])
 			info = ((Fore.CYAN + str(len(custom_request['cookies']))+ Fore.MAGENTA), self._logh)
 			print_info("Cookies from request file: %s" % (info[0]))
-		
-		# Parse custom cookies from command line if provided (these will be added to request file cookies)
-		if hasattr(smargs, 'cookies') and smargs.cookies:
-			self._parse_custom_cookies(smargs.cookies)
+
+		if cookies_str:
+			self._parse_custom_cookies(cookies_str)
+
+	@classmethod
+	def from_args(cls, configfile, host, port, url, method, endpoint, ssl_flag,
+			logh, args, custom_request=None):
+		"""Build a Desyncr from an argparse.Namespace -- keeps __main__ tidy
+		while preserving the explicit-arg constructor for testing."""
+		return cls(
+			configfile=configfile,
+			smhost=host,
+			smport=port,
+			url=url,
+			method=method,
+			endpoint=endpoint,
+			SSLFlag=ssl_flag,
+			logh=logh,
+			custom_request=custom_request,
+			vhost=getattr(args, 'vhost', '') or '',
+			timeout=getattr(args, 'timeout', 5.0),
+			quiet=getattr(args, 'quiet', False),
+			exit_early=getattr(args, 'exit_early', False),
+			proxy=getattr(args, 'proxy', None),
+			cookies_str=getattr(args, 'cookies', None),
+			persistent_connection=getattr(args, 'persistent_connection', False),
+		)
 
 	def _parse_custom_cookies(self, cookie_string):
 		"""Parse custom cookies from command line argument and add to self._cookies"""
@@ -114,46 +142,57 @@ class Desyncr():
 				error = ((Fore.CYAN + "Error closing persistent connection: " + str(e) + Fore.MAGENTA), self._logh)
 				print_info("Error      : %s" % (error[0]))
 
+	# Translation table to flatten any byte > 0x7F to '0' (0x30). Faster than
+	# building a string char-by-char in Python.
+	_HIGHBIT_TO_ZERO = bytes(
+		[(b if b <= 0x7F else 0x30) for b in range(256)]
+	)
+
 	def _test(self, payload_obj):
+		using_persistent = self._persistent_connection and self._web_connection is not None
 		try:
-			# Use persistent connection if available, otherwise create a new one
-			if self._persistent_connection and self._web_connection:
+			if using_persistent:
 				web = self._web_connection
 			else:
 				web = EasySSL(self.ssl_flag)
 				web.connect(self._host, self._port, self._timeout, self._proxy)
-			
+
 			web.send(str(payload_obj).encode())
-			#print(payload_obj)
 			start_time = datetime.now()
 			res = web.recv_nb(self._timeout)
 			end_time = datetime.now()
-			
-			# Only close if not using persistent connection
+
+			# Persistent connection contract: any non-clean response
+			# (timeout, disconnect, malformed) can leave undrained bytes that
+			# poison the *next* mutation. Force-reset on anything other than
+			# a clean response to stop cascading false positives.
+			anomalous = res is None
 			if not self._persistent_connection:
 				web.close()
-			
+			elif anomalous:
+				try:
+					web.close()
+				except Exception:
+					pass
+				self._web_connection = None
+				self._establish_persistent_connection()
+
 			if res is None:
-				delta_time = end_time - start_time
-				if delta_time.seconds < (self._timeout-1):
-					return (2, res, payload_obj) # Return code 2 if disconnected before timeout
-				return (1, res, payload_obj) # Return code 1 if connection timedout
-			# Filter out problematic characters
-			res_filtered = ""
-			for single in res:
-				if single > 0x7F:
-					res_filtered += '\x30'
-				else:
-					res_filtered += chr(single)
-			res = res_filtered
-			#if '504' in res:
-			
-			#print("\n\n"+str(str(payload_obj)))
-			#print("\n\n"+res)
-			return (0, res, payload_obj) # Return code 0 if normal response returned
-		except Exception as exception_data:
-			#print(exception_data)
-			return (-1, None, payload_obj) # Return code -1 if some except occured
+				delta_seconds = (end_time - start_time).total_seconds()
+				if delta_seconds < (self._timeout - 1):
+					return (2, res, payload_obj)  # disconnected before timeout
+				return (1, res, payload_obj)  # connection timed out
+			res = res.translate(self._HIGHBIT_TO_ZERO).decode('latin-1', errors='replace')
+			return (0, res, payload_obj)  # normal response
+		except Exception:
+			if self._persistent_connection and self._web_connection is not None:
+				try:
+					self._web_connection.close()
+				except Exception:
+					pass
+				self._web_connection = None
+				self._establish_persistent_connection()
+			return (-1, None, payload_obj)
 		
 	def _get_cookies(self):
 		RN = "\r\n"
@@ -187,13 +226,25 @@ class Desyncr():
 			res = web.recv_nb(2.0)
 			web.close()
 			if (res is not None):
-				res = res.decode().split("\r\n")
-				for elem in res:
-					if len(elem) > 11:
-						if elem[0:11].lower().replace(" ", "") == "set-cookie:":
-							cookie = elem.lower().replace("set-cookie:","")
-							cookie = cookie.split(";")[0] + ';'
-							cookies += [cookie]
+				# Decode permissively; servers occasionally send latin-1 cookies.
+				try:
+					res_lines = res.decode().split("\r\n")
+				except UnicodeDecodeError:
+					res_lines = res.decode('latin-1', errors='replace').split("\r\n")
+				for elem in res_lines:
+					if len(elem) <= len("set-cookie:"):
+						continue
+					# Only the *header name* comparison is case-insensitive.
+					# Preserve original cookie body so values like JWTs that
+					# rely on case survive intact.
+					name_part, _, value_part = elem.partition(":")
+					if name_part.strip().lower() != "set-cookie":
+						continue
+					cookie = value_part.strip()
+					if not cookie:
+						continue
+					cookie = cookie.split(";")[0].strip() + ';'
+					cookies += [cookie]
 				info = ((Fore.CYAN + str(len(cookies))+ Fore.MAGENTA), self._logh)
 				print_info("Cookies    : %s (Appending to the attack)" % (info[0]))
 				self._cookies += cookies
@@ -226,7 +277,10 @@ class Desyncr():
 			
 		script = f.read()
 		f.close()
-		
+
+		# NOTE: config files are arbitrary Python evaluated in this scope so
+		# they can construct Payload() objects directly. Only ever load
+		# configs you trust -- they have full process privileges.
 		exec(script)
 			
 		for mutation_name in mutations.keys():
@@ -287,6 +341,9 @@ class Desyncr():
 			"parser-discrepancy": ScanParserDiscrepancy,
 			"header-removal": ScanHeaderRemoval,
 			"expect": ScanExpectDesync,
+			"te0": ScanTE0,
+			"bare-lf": ScanBareLFChunked,
+			"hop-by-hop": ScanHopByHop,
 		}
 
 		for scan_name in scan_types:
@@ -340,7 +397,6 @@ class Desyncr():
 		else:
 			te_payload.cl = 5 # timeout val == 6, good value == 5
 		te_payload.body = EndChunk+"X"
-		#print (te_payload)
 		return self._test(te_payload)
 
 	# ptype == 0 (timeout payload, timeout could mean potential CLTE desync)
@@ -362,8 +418,90 @@ class Desyncr():
 		else:
 			te_payload.cl = 11 # timeout val == 4, good value == 11
 		te_payload.body = Chunked("Z")+EndChunk
-		#print (te_payload)
 		return self._test(te_payload)
+
+	def _confirm_timeout_anomaly(self, check_fn, payload, tries=3):
+		"""Iterative replacement for the old recursive _attempts dance.
+
+		Returns True when the timeout (anomaly) payload reliably times out and
+		the edge-case payload (ptype=1) reliably succeeds across `tries`
+		attempts. This is purely a timing oracle, prone to false positives on
+		slow upstreams; pair it with `_smuggle_gadget_probe` for confirmation.
+		"""
+		for _ in range(tries):
+			anomaly_res = check_fn(payload, 0)
+			if anomaly_res[0] != 1:
+				return False
+			edge_res = check_fn(payload, 1)
+			if edge_res[0] != 0:
+				return False
+		return True
+
+	def _smuggle_gadget_probe(self, payload, mode):
+		"""Send a smuggling payload (CL.TE-shaped or TE.CL-shaped depending on
+		`mode`) followed by a victim GET on the same connection, then check
+		whether the victim response was contaminated by the smuggled gadget.
+
+		mode == "clte": front-end honors CL, backend honors TE. Smuggle a
+		            request inside what the front-end thinks is a chunk body.
+		mode == "tecl": front-end honors TE, backend honors CL.
+
+		Returns True only when the victim response leaks /robots.txt's
+		`Disallow` line that we never asked for. Combined with the timing
+		oracle this drops false-positive rate substantially.
+		"""
+		gadget_path = "/robots.txt"
+		gadget_token = "llow:"
+		smuggled = "GET %s HTTP/1.1\r\nHost: %s\r\nX-Smug: 1\r\n\r\n" % (
+			gadget_path, self._vhost or self._host
+		)
+
+		attack = deepcopy(payload)
+		attack.host = self._vhost or self._host
+		attack.method = self._method
+		attack.endpoint = self._endpoint
+		if len(self._cookies) > 0:
+			attack.header += "Cookie: " + ''.join(self._cookies) + "\r\n"
+
+		if mode == "clte":
+			# CL.TE: front-end uses Content-Length, reads only what fits;
+			# backend processes chunked, sees the smuggled prefix after the
+			# zero-chunk terminator.
+			body = "0\r\n\r\n" + smuggled
+			attack.cl = len("0\r\n\r\n")  # front-end sees the terminator and stops
+			attack.body = body
+		elif mode == "tecl":
+			# TE.CL: front-end uses Transfer-Encoding (sees full chunked body
+			# then leftover smuggled bytes that the backend reads as the next
+			# request via its honored Content-Length).
+			payload_size_hex = "%x" % len(smuggled)
+			body = payload_size_hex + "\r\n" + smuggled + "\r\n" + "0\r\n\r\n"
+			attack.cl = len(body)
+			attack.body = body
+		else:
+			return False
+
+		victim = "GET %s?vcb=%d HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % (
+			self._endpoint, random.randint(1, 1 << 30), self._vhost or self._host
+		)
+
+		try:
+			web = EasySSL(self.ssl_flag)
+			web.connect(self._host, self._port, self._timeout, self._proxy)
+			web.pipeline_send([str(attack).encode(), victim.encode()])
+			raw = web.recv_all(self._timeout)
+			web.close()
+		except Exception:
+			return False
+		if not raw:
+			return False
+		try:
+			text = raw.decode('latin-1', errors='replace')
+		except Exception:
+			return False
+		# We sent two requests; the gadget token should only appear if the
+		# backend served /robots.txt instead of (or in addition to) our victim.
+		return gadget_token in text
 
 
 	def _create_exec_test(self, name, te_payload):
@@ -399,90 +537,73 @@ class Desyncr():
 			with open(fname, 'wb') as file:
 				file.write(bytes(str(payload),'utf-8'))
 
-		# First lets test TECL
+		# Initial probe pair
 		pretty_print(name, "Checking TECL...")
 		start_time = time.time()
 		tecl_res = self._check_tecl(te_payload, 0)
-		tecl_time = time.time()-start_time
+		tecl_time = time.time() - start_time
 
-		# Next lets test CLTE
 		pretty_print(name, "Checking CLTE...")
 		start_time = time.time()
 		clte_res = self._check_clte(te_payload, 0)
-		clte_time = time.time()-start_time
+		clte_time = time.time() - start_time
 
-		if (clte_res[0] == 1):
-			# Potential CLTE found
-			# Lets check the edge case to be sure
-			clte_res2 = self._check_clte(te_payload, 1)
-			if clte_res2[0] == 0:
-				self._attempts += 1
-				if (self._attempts < 3):
-					return self._create_exec_test(name, te_payload)
-				else:
-					dismsg = Fore.RED + "Potential CLTE Issue Found" + Fore.MAGENTA + " - " + Fore.CYAN + self._method + Fore.MAGENTA + " @ " + Fore.CYAN + ["http://","https://",][self.ssl_flag]+ self._host + self._endpoint + Fore.MAGENTA + " - " + Fore.CYAN + self._configfile.split('/')[-1] + "\n"
-					pretty_print(name, dismsg)
-					
-					# Write payload out to file
-					write_payload(self._host, clte_res[2], "CLTE")
-					self._attempts = 0
-					return True
-
-			else:
-				# No edge behavior found
-				dismsg = Fore.YELLOW + "CLTE TIMEOUT ON BOTH LENGTH 4 AND 11" + ["\n", ""][self._quiet]
+		# CLTE takes precedence over TECL when both timeouts fire (matches
+		# original tool behavior).
+		def report(kind, kind_res):
+			# Iterative confirmation (replaces the recursive _attempts dance).
+			check_fn = self._check_clte if kind == "CLTE" else self._check_tecl
+			pretty_print(name, "Confirming %s (timing)..." % kind)
+			if not self._confirm_timeout_anomaly(check_fn, te_payload, tries=2):
+				dismsg = Fore.YELLOW + ("%s TIMING NOT REPRODUCIBLE" % kind) + ["\n", ""][self._quiet]
 				pretty_print(name, dismsg)
+				return False
 
-		elif (tecl_res[0] == 1):
-			# Potential TECL found
-			# Lets check the edge case to be sure
-			tecl_res2 = self._check_tecl(te_payload, 1)
-			if tecl_res2[0] == 0:
-				self._attempts += 1
-				if (self._attempts < 3):
-					return self._create_exec_test(name, te_payload)
-				else:
-					#print (str(tecl_res2[2]))
-					#print (tecl_res2[1])
-					dismsg = Fore.RED + "Potential TECL Issue Found" + Fore.MAGENTA + " - " + Fore.CYAN + self._method + Fore.MAGENTA + " @ " + Fore.CYAN + ["http://","https://",][self.ssl_flag]+ self._host + self._endpoint + Fore.MAGENTA + " - " + Fore.CYAN + self._configfile.split('/')[-1] + "\n"
-					pretty_print(name, dismsg)
-					
-					# Write payload out to file
-					write_payload(self._host, tecl_res[2], "TECL")
-					self._attempts = 0
-					return True
-			else:
-				# No edge behavior found
-				dismsg = Fore.YELLOW + "TECL TIMEOUT ON BOTH LENGTH 6 AND 5" + ["\n", ""][self._quiet]
-				pretty_print(name, dismsg)
+			# Positive smuggling oracle: try to actually surface the gadget.
+			# Failure here doesn't veto the timing finding (some backends
+			# block /robots.txt smuggling but are still desynced), but a
+			# success is much stronger evidence.
+			pretty_print(name, "Confirming %s (gadget probe)..." % kind)
+			gadget_hit = False
+			try:
+				gadget_hit = self._smuggle_gadget_probe(te_payload, kind.lower())
+			except Exception:
+				gadget_hit = False
 
+			confidence = "CONFIRMED" if gadget_hit else "Potential"
+			scheme = ["http://", "https://"][self.ssl_flag]
+			dismsg = (
+				Fore.RED + ("%s %s Issue Found" % (confidence, kind))
+				+ Fore.MAGENTA + " - " + Fore.CYAN + self._method
+				+ Fore.MAGENTA + " @ " + Fore.CYAN + scheme + self._host + self._endpoint
+				+ Fore.MAGENTA + " - " + Fore.CYAN + self._configfile.split('/')[-1]
+				+ ("" if not gadget_hit else Fore.MAGENTA + " [gadget=/robots.txt]")
+				+ "\n"
+			)
+			pretty_print(name, dismsg)
+			write_payload(self._host, kind_res[2], kind)
+			return True
 
-		#elif ((tecl_res[0] == 1) and (clte_res[0] == 1)):
-		#	# Both types of payloads not supported
-		#	dismsg = Fore.YELLOW + "NOT SUPPORTED" + ["\n", ""][self._quiet]
-		#	pretty_print(name, dismsg)
-		elif ((tecl_res[0] == -1) or (clte_res[0] == -1)):
-			# ERROR
+		if clte_res[0] == 1:
+			if report("CLTE", clte_res):
+				return True
+		elif tecl_res[0] == 1:
+			if report("TECL", tecl_res):
+				return True
+		elif (tecl_res[0] == -1) or (clte_res[0] == -1):
 			dismsg = Fore.YELLOW + "SOCKET ERROR" + ["\n", ""][self._quiet]
 			pretty_print(name, dismsg)
-
-		elif ((tecl_res[0] == 0) and (clte_res[0] == 0)):
-			# No Desync Found
-			tecl_msg = (Fore.MAGENTA + " (TECL: " + Fore.CYAN +"%.2f" + Fore.MAGENTA + " - " + \
-			Fore.CYAN +"%s" + Fore.MAGENTA + ")") % (tecl_time, tecl_res[1][9:9+3])
-
-			clte_msg = (Fore.MAGENTA + " (CLTE: " + Fore.CYAN +"%.2f" + Fore.MAGENTA + " - " + \
-			Fore.CYAN +"%s" + Fore.MAGENTA + ")") % (clte_time, clte_res[1][9:9+3])
-
+		elif (tecl_res[0] == 0) and (clte_res[0] == 0):
+			tecl_msg = (Fore.MAGENTA + " (TECL: " + Fore.CYAN + "%.2f" + Fore.MAGENTA + " - " +
+				Fore.CYAN + "%s" + Fore.MAGENTA + ")") % (tecl_time, tecl_res[1][9:9+3])
+			clte_msg = (Fore.MAGENTA + " (CLTE: " + Fore.CYAN + "%.2f" + Fore.MAGENTA + " - " +
+				Fore.CYAN + "%s" + Fore.MAGENTA + ")") % (clte_time, clte_res[1][9:9+3])
 			dismsg = Fore.GREEN + "OK" + tecl_msg + clte_msg + ["\n", ""][self._quiet]
 			pretty_print(name, dismsg)
-
-		elif ((tecl_res[0] == 2) or (clte_res[0] == 2)):
-			# Disconnected
+		elif (tecl_res[0] == 2) or (clte_res[0] == 2):
 			dismsg = Fore.YELLOW + "DISCONNECTED" + ["\n", ""][self._quiet]
 			pretty_print(name, dismsg)
-			
-		self._attempts = 0
+
 		return False
 
 class ReplayManager():
@@ -543,215 +664,145 @@ class ReplayManager():
 			except Exception as e:
 				print_info(f"Error closing persistent connection: {e}")
 	
-	def send_request(self, request_id):
-		"""Send a single request and return the result"""
+	# stat key -> (total_key, success_key, fail_key, timeout_key, error_key)
+	_STAT_BUCKETS = {
+		'attack': ('total_requests', 'successful_requests', 'failed_requests', 'timeout_requests', 'error_requests'),
+		'baseline': ('baseline_requests', 'baseline_successful', 'baseline_failed', 'baseline_timeout', 'baseline_error'),
+	}
+
+	def _send_with_id(self, request_id, build_fn, bucket):
+		"""Generic send: builds the request via `build_fn(request_id)`, sends
+		it on the persistent or per-request socket, classifies the outcome,
+		and bumps the appropriate stat bucket. Replaces the previous
+		near-duplicate send_request / send_baseline_request pair."""
+		total_k, ok_k, fail_k, timeout_k, error_k = self._STAT_BUCKETS[bucket]
 		try:
-			# Use persistent connection if available, otherwise create a new one
-			if self.persistent_connection and self.web_connection:
+			if self.persistent_connection and self.web_connection and getattr(self.web_connection, 'connected', False):
 				web = self.web_connection
-				# Check if connection is still valid
-				if not hasattr(web, 'connected') or not web.connected:
-					# Connection is not valid, try to re-establish
-					self.establish_persistent_connection()
-					if self.web_connection:
-						web = self.web_connection
-					else:
-						# Fall back to new connection
-						web = EasySSL(self.ssl_flag)
-						web.connect(self.host, self.port, self.timeout, self.proxy)
+			elif self.persistent_connection:
+				self.establish_persistent_connection()
+				web = self.web_connection
+				if web is None:
+					web = EasySSL(self.ssl_flag)
+					web.connect(self.host, self.port, self.timeout, self.proxy)
 			else:
 				web = EasySSL(self.ssl_flag)
 				web.connect(self.host, self.port, self.timeout, self.proxy)
-			
-			# Build the request with unique identifier
-			request_data = self.build_request_with_id(request_id)
+
+			request_data = build_fn(request_id)
 			web.send(request_data.encode())
-			
+
 			start_time = datetime.now()
 			res = web.recv_nb(self.timeout)
 			end_time = datetime.now()
-			
-			# Only close if not using persistent connection
+
 			if not self.persistent_connection:
 				web.close()
-			
-			self.stats['total_requests'] += 1
-			self.stats['last_request_time'] = end_time
-			
+
+			self.stats[total_k] += 1
+			if bucket == 'attack':
+				self.stats['last_request_time'] = end_time
+
 			if res is None:
-				delta_time = end_time - start_time
-				if delta_time.seconds < (self.timeout - 1):
-					self.stats['failed_requests'] += 1
-					return (2, res, request_id)  # Disconnected
-				else:
-					self.stats['timeout_requests'] += 1
-					return (1, res, request_id)  # Timeout
-			else:
-				self.stats['successful_requests'] += 1
-				return (0, res, request_id)  # Success
-				
-		except Exception as e:
-			self.stats['error_requests'] += 1
-			# If using persistent connection and we get an error, try to reset it
-			if self.persistent_connection and self.web_connection:
-				try:
-					self.web_connection.close()
-					self.web_connection = None
-				except:
-					pass
-				# Try to re-establish connection
-				self.establish_persistent_connection()
-			return (-1, None, request_id)  # Error
-	
+				delta_seconds = (end_time - start_time).total_seconds()
+				if delta_seconds < (self.timeout - 1):
+					self.stats[fail_k] += 1
+					self._reset_persistent_on_anomaly()
+					return (2, res, request_id)
+				self.stats[timeout_k] += 1
+				self._reset_persistent_on_anomaly()
+				return (1, res, request_id)
+			self.stats[ok_k] += 1
+			return (0, res, request_id)
+		except Exception:
+			self.stats[error_k] += 1
+			self._reset_persistent_on_anomaly()
+			return (-1, None, request_id)
+
+	def _reset_persistent_on_anomaly(self):
+		"""Tear down and re-establish the persistent connection. Any anomaly
+		may have left undrained bytes that would poison subsequent reads."""
+		if not self.persistent_connection or self.web_connection is None:
+			return
+		try:
+			self.web_connection.close()
+		except Exception:
+			pass
+		self.web_connection = None
+		self.establish_persistent_connection()
+
+	def send_request(self, request_id):
+		return self._send_with_id(request_id, self.build_request_with_id, 'attack')
+
 	def send_baseline_request(self, request_id):
-		"""Send a baseline request and return the result"""
 		if not self.baseline_request:
 			return None
-			
-		try:
-			# Use persistent connection if available, otherwise create a new one
-			if self.persistent_connection and self.web_connection:
-				web = self.web_connection
-				# Check if connection is still valid
-				if not hasattr(web, 'connected') or not web.connected:
-					# Connection is not valid, try to re-establish
-					self.establish_persistent_connection()
-					if self.web_connection:
-						web = self.web_connection
-					else:
-						# Fall back to new connection
-						web = EasySSL(self.ssl_flag)
-						web.connect(self.host, self.port, self.timeout, self.proxy)
-			else:
-				web = EasySSL(self.ssl_flag)
-				web.connect(self.host, self.port, self.timeout, self.proxy)
-			
-			# Build the baseline request with unique identifier
-			request_data = self.build_baseline_request_with_id(request_id)
-			web.send(request_data.encode())
-			
-			start_time = datetime.now()
-			res = web.recv_nb(self.timeout)
-			end_time = datetime.now()
-			
-			# Only close if not using persistent connection
-			if not self.persistent_connection:
-				web.close()
-			
-			self.stats['baseline_requests'] += 1
-			
-			if res is None:
-				delta_time = end_time - start_time
-				if delta_time.seconds < (self.timeout - 1):
-					self.stats['baseline_failed'] += 1
-					return (2, res, request_id)  # Disconnected
-				else:
-					self.stats['baseline_timeout'] += 1
-					return (1, res, request_id)  # Timeout
-			else:
-				self.stats['baseline_successful'] += 1
-				return (0, res, request_id)  # Success
-				
-		except Exception as e:
-			self.stats['baseline_error'] += 1
-			# If using persistent connection and we get an error, try to reset it
-			if self.persistent_connection and self.web_connection:
-				try:
-					self.web_connection.close()
-					self.web_connection = None
-				except:
-					pass
-				# Try to re-establish connection
-				self.establish_persistent_connection()
-			return (-1, None, request_id)  # Error
+		return self._send_with_id(request_id, self.build_baseline_request_with_id, 'baseline')
 	
+	_HTTP_METHODS = ('GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS', 'PATCH', 'CONNECT', 'TRACE')
+
+	def _build_request_with_id(self, request_blob, request_id, id_param_name):
+		"""Inject an id+timestamp query string into the first request line and
+		rebuild the request. Critically: when the request has a body, we
+		recompute Content-Length so a strict backend doesn't reject the
+		request (or worse, desync the connection and be misreported as a
+		finding)."""
+		raw = request_blob.get('raw', '')
+		# Preserve raw CRLF/LF boundary then normalize at the end.
+		lines = raw.split('\n')
+
+		first_idx = 0
+		for i, line in enumerate(lines):
+			line_stripped = line.strip()
+			if line_stripped and ' ' in line_stripped:
+				parts = line_stripped.split(' ')
+				if len(parts) >= 2 and parts[0] in self._HTTP_METHODS:
+					first_idx = i
+					break
+
+		request_line = lines[first_idx].strip()
+		request_parts = request_line.split(' ')
+		method = request_parts[0]
+		endpoint = request_parts[1]
+		http_version = request_parts[2] if len(request_parts) > 2 else "HTTP/1.1"
+
+		timestamp = int(time.time() * 1000)
+		separator = '&' if '?' in endpoint else '?'
+		modified_endpoint = "%s%s%s=%s&timestamp=%d" % (
+			endpoint, separator, id_param_name, request_id, timestamp
+		)
+		lines[first_idx] = "%s %s %s" % (method, modified_endpoint, http_version)
+
+		# Locate header/body boundary so we can recompute Content-Length on
+		# the actual body bytes (handles both LF-only and CRLF-LF files).
+		body_idx = None
+		for j in range(first_idx + 1, len(lines)):
+			if lines[j].strip() == "":
+				body_idx = j
+				break
+
+		if body_idx is not None:
+			body_bytes = '\n'.join(lines[body_idx + 1:])
+			# Re-normalize body to CRLF for the wire so length accounting is
+			# consistent with what the server will see.
+			body_crlf = body_bytes.replace('\r\n', '\n').replace('\n', '\r\n')
+			cl = len(body_crlf.encode('latin-1', errors='replace'))
+			for k in range(first_idx + 1, body_idx):
+				name_part = lines[k].split(':', 1)[0].strip().lower()
+				if name_part == 'content-length':
+					lines[k] = 'Content-Length: %d' % cl
+					break
+
+		modified_request = '\n'.join(lines)
+		# Normalize to CRLF for the wire.
+		modified_request = modified_request.replace('\r\n', '\n').replace('\n', '\r\n')
+		return modified_request
+
 	def build_request_with_id(self, request_id):
-		"""Build the HTTP request with unique identifier injected as URL parameters"""
-		# Get the raw content and split into lines
-		lines = self.custom_request['raw'].split('\n')
-		
-		# Find the first request line (starts with HTTP method)
-		first_request_line_idx = 0
-		for i, line in enumerate(lines):
-			line_stripped = line.strip()
-			if line_stripped and ' ' in line_stripped:
-				parts = line_stripped.split(' ')
-				if len(parts) >= 2 and parts[0] in ['GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS', 'PATCH']:
-					first_request_line_idx = i
-					break
-		
-		# Get the first request line
-		request_line = lines[first_request_line_idx].strip()
-		
-		# Extract method, endpoint, and HTTP version
-		request_parts = request_line.split(' ')
-		method = request_parts[0]
-		endpoint = request_parts[1]
-		http_version = request_parts[2] if len(request_parts) > 2 else "HTTP/1.1"
-		
-		# Add request ID and timestamp as URL parameters to the first request
-		timestamp = int(time.time() * 1000)
-		separator = '&' if '?' in endpoint else '?'
-		modified_endpoint = f"{endpoint}{separator}request_id={request_id}&timestamp={timestamp}"
-		
-		# Build the modified request line
-		modified_request_line = f"{method} {modified_endpoint} {http_version}"
-		
-		# Rebuild the entire request with the modified first line
-		modified_lines = lines.copy()
-		modified_lines[first_request_line_idx] = modified_request_line
-		
-		# Convert back to string and ensure proper line endings
-		modified_request = '\n'.join(modified_lines)
-		
-		# Convert \n to \r\n for proper HTTP format
-		modified_request = modified_request.replace('\n', '\r\n')
-		
-		return modified_request
-	
+		return self._build_request_with_id(self.custom_request, request_id, 'request_id')
+
 	def build_baseline_request_with_id(self, request_id):
-		"""Build the baseline HTTP request with unique identifier injected as URL parameters"""
-		# Get the raw content and split into lines
-		lines = self.baseline_request['raw'].split('\n')
-		
-		# Find the first request line (starts with HTTP method)
-		first_request_line_idx = 0
-		for i, line in enumerate(lines):
-			line_stripped = line.strip()
-			if line_stripped and ' ' in line_stripped:
-				parts = line_stripped.split(' ')
-				if len(parts) >= 2 and parts[0] in ['GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS', 'PATCH']:
-					first_request_line_idx = i
-					break
-		
-		# Get the first request line
-		request_line = lines[first_request_line_idx].strip()
-		
-		# Extract method, endpoint, and HTTP version
-		request_parts = request_line.split(' ')
-		method = request_parts[0]
-		endpoint = request_parts[1]
-		http_version = request_parts[2] if len(request_parts) > 2 else "HTTP/1.1"
-		
-		# Add request ID and timestamp as URL parameters to the first request
-		timestamp = int(time.time() * 1000)
-		separator = '&' if '?' in endpoint else '?'
-		modified_endpoint = f"{endpoint}{separator}baseline_id={request_id}&timestamp={timestamp}"
-		
-		# Build the modified request line
-		modified_request_line = f"{method} {modified_endpoint} {http_version}"
-		
-		# Rebuild the entire request with the modified first line
-		modified_lines = lines.copy()
-		modified_lines[first_request_line_idx] = modified_request_line
-		
-		# Convert back to string and ensure proper line endings
-		modified_request = '\n'.join(modified_lines)
-		
-		# Convert \n to \r\n for proper HTTP format
-		modified_request = modified_request.replace('\n', '\r\n')
-		
-		return modified_request
+		return self._build_request_with_id(self.baseline_request, request_id, 'baseline_id')
 	
 	def compare_responses(self, smuggled_response, baseline_response):
 		"""Compare smuggled response with baseline response and return differences"""
@@ -979,6 +1030,78 @@ def parse_request_file(filepath):
 		print_info("Error parsing request file: %s" % (Fore.CYAN + str(e)))
 		exit(1)
 
+
+def warn_if_request_unsafe_for_scan_mode(parsed, filepath):
+	"""Emit warnings when a -r/--request file looks like a smuggling POC.
+
+	In scan mode (no --replay) Smuggler only consumes the request file as a
+	template -- it pulls method/endpoint/host/cookies and synthesizes its
+	own smuggling payloads from the chosen config. Anything else in the
+	file (body, additional request lines, header CRLF injection) is
+	silently ignored. Users who pasted a Burp POC sometimes expect those
+	bytes to be sent on the wire and get confused when they aren't.
+
+	This is a no-op in replay mode (`--replay` sends the file verbatim).
+	"""
+	raw = parsed.get('raw', '') or ''
+	body = parsed.get('body', '') or ''
+	headers_section = parsed.get('headers', '') or ''
+	warnings = []
+
+	method_verbs = ('GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS', 'PATCH', 'CONNECT', 'TRACE')
+
+	# Body present at all -> ignored in scan mode. Pre-empt the "where did
+	# my payload go?" confusion.
+	if body.strip():
+		warnings.append("body bytes (%d) will be ignored -- scan mode synthesizes its own payload bodies" % len(body))
+
+	# Heuristic: body contains an HTTP method + " HTTP/" within the first
+	# few lines -> smuggled-prefix POC (chunked POCs typically have a
+	# `0\r\n\r\n` zero-chunk before the request line). Surface explicitly.
+	for body_line in body.lstrip().split('\n', 10)[:10]:
+		body_line = body_line.strip()
+		if not body_line:
+			continue
+		toks = body_line.split(' ', 2)
+		if len(toks) >= 3 and toks[0] in method_verbs and toks[2].startswith('HTTP/'):
+			warnings.append("body contains an embedded request line (%r) -- this is a smuggling POC, use --replay to send verbatim" % body_line[:80])
+			break
+
+	# Heuristic: a second request line *inside* the headers section (not the
+	# body) is almost always an attempted smuggle that won't survive
+	# template extraction.
+	header_lines = headers_section.split('\n')[1:]  # skip the real request line
+	for line in header_lines:
+		token = line.strip().split(' ', 1)
+		if token and token[0] in method_verbs:
+			warnings.append("looks like an embedded second request line (%r) -- pass with --replay if you intended to send it verbatim" % line.strip()[:80])
+			break
+
+	# Heuristic: header VALUE containing what looks like a request line
+	# (Bearer-token-style POC where the value embeds another GET/POST).
+	for line in header_lines:
+		if ':' not in line:
+			continue
+		_, _, value = line.partition(':')
+		v = value.strip()
+		for verb in ('GET ', 'POST ', 'PUT ', 'DELETE ', 'HEAD ', 'OPTIONS '):
+			if verb in v and ' HTTP/' in v:
+				warnings.append("header value contains an embedded request line (%r) -- this is a POC-shaped file, scan mode will not send it" % line.strip()[:80])
+				break
+
+	if '\r\n\r\n' in raw and raw.split('\r\n\r\n', 1)[1].strip():
+		# Body is present and non-empty; already warned above, but if we
+		# DIDN'T warn (body was whitespace) skip.
+		pass
+
+	if not warnings:
+		return
+
+	print_info("Notice: %s contains content that will NOT be used in scan mode:" % (Fore.CYAN + filepath))
+	for w in warnings:
+		print_info("        - " + Fore.YELLOW + w)
+	print_info("        Use " + Fore.CYAN + "--replay" + Fore.MAGENTA + " to send the request verbatim, or " + Fore.CYAN + "--baseline-request" + Fore.MAGENTA + " for a control sample.")
+
 def process_uri(uri):
 	u = urlparse(uri)
 
@@ -992,10 +1115,15 @@ def process_uri(uri):
 		print_info("Error malformed URL not supported: %s" % (Fore.CYAN + uri))
 		exit(1)
 
+	path = u.path or "/"
 	if u.port:
-		return (u.hostname, u.port, u.path, ssl_flag)
+		return (u.hostname, u.port, path, ssl_flag)
 	else:
-		return (u.hostname, std_port, u.path, ssl_flag)
+		return (u.hostname, std_port, path, ssl_flag)
+
+# Module-level default so importers (tests, other tools) can call CF()
+# before __main__ has a chance to populate the global.
+NOCOLOR = False
 
 def CF(text):
 	global NOCOLOR
@@ -1026,7 +1154,6 @@ def print_info(msg, file_handle=None):
 		file_handle.write(plaintext+"\n")
 
 if __name__ == "__main__":
-	global NOCOLOR
 	if sys.version_info < (3, 0):
 		print("Error: Smuggler requires Python 3.x")
 		sys.exit(1)
@@ -1047,7 +1174,7 @@ if __name__ == "__main__":
 	Parser.add_argument('--replay', action='store_true', help="Replay the request file continuously until stopped (Ctrl+C)")
 	Parser.add_argument('--baseline-request', help="File containing normal HTTP request for baseline comparison in replay mode (sent immediately after smuggling POC)")
 	Parser.add_argument('--persistent-connection', action='store_true', help="Use a single persistent TCP connection for all requests instead of creating new connections")
-	Parser.add_argument('--scan-type', default="tecl,clte", help="Comma-separated scan types: tecl,clte,cl0,pause,connection-state,parser-discrepancy,header-removal,expect,h2,all (default: tecl,clte)")
+	Parser.add_argument('--scan-type', default="tecl,clte", help="Comma-separated scan types: tecl,clte,cl0,pause,connection-state,parser-discrepancy,header-removal,expect,te0,bare-lf,hop-by-hop,h2,all (default: tecl,clte)")
 	Parser.add_argument('--http2', action='store_true', help="Enable HTTP/2 downgrade scans")
 	Parser.add_argument('--pause-timeout', type=int, default=61, help="Timeout in seconds for pause-based desync (default: 61)")
 	Args = Parser.parse_args()  # returns data from the options specified (echo)
@@ -1068,12 +1195,22 @@ if __name__ == "__main__":
 	if Args.request:
 		custom_request = parse_request_file(Args.request)
 		print_info("Request File: %s"%(Fore.CYAN + Args.request))
+		# In scan mode the request file is only a template for
+		# method/endpoint/host/cookies -- warn the user if their file
+		# contains body bytes or smuggling POC content that scan mode
+		# would silently ignore.
+		if not Args.replay:
+			warn_if_request_unsafe_for_scan_mode(custom_request, Args.request)
 	
 	# Parse baseline request file if provided
 	baseline_request = None
 	if Args.baseline_request:
 		baseline_request = parse_request_file(Args.baseline_request)
 		print_info("Baseline Request File: %s"%(Fore.CYAN + Args.baseline_request))
+		# Baseline is always sent verbatim alongside the smuggle request
+		# for comparison -- if THIS one looks POC-shaped the comparison is
+		# meaningless, so always warn regardless of mode.
+		warn_if_request_unsafe_for_scan_mode(baseline_request, Args.baseline_request)
 	
 	# Handle replay mode
 	if Args.replay:
@@ -1197,18 +1334,21 @@ if __name__ == "__main__":
 		requested_scans = [s.strip() for s in scan_types_str.split(",") if s.strip()]
 		if "all" in requested_scans:
 			requested_scans = ["tecl", "clte", "cl0", "pause", "connection-state",
-				"parser-discrepancy", "header-removal", "expect", "h2"]
+				"parser-discrepancy", "header-removal", "expect",
+				"te0", "bare-lf", "hop-by-hop", "h2"]
 
 		classic_scans = [s for s in requested_scans if s in ("tecl", "clte")]
 		advanced_scans = [s for s in requested_scans if s not in ("tecl", "clte")]
 
 		if classic_scans:
-			sm = Desyncr(configfile, host, port, url=server[0], method=method, endpoint=endpoint, SSLFlag=SSLFlagval, logh=FileHandle, smargs=Args, custom_request=custom_request)
+			sm = Desyncr.from_args(configfile, host, port, server[0], method, endpoint,
+				SSLFlagval, FileHandle, Args, custom_request=custom_request)
 			sm.run()
 
 		if advanced_scans:
 			print_info("Advanced   : %s"%(Fore.CYAN + ", ".join(advanced_scans)), FileHandle)
-			sm_adv = Desyncr(configfile, host, port, url=server[0], method=method, endpoint=endpoint, SSLFlag=SSLFlagval, logh=FileHandle, smargs=Args, custom_request=custom_request)
+			sm_adv = Desyncr.from_args(configfile, host, port, server[0], method, endpoint,
+				SSLFlagval, FileHandle, Args, custom_request=custom_request)
 			sm_adv.run_advanced_scans(advanced_scans, pause_timeout=Args.pause_timeout)
 
 

@@ -1,0 +1,10 @@
+POST /data/identity/applications HTTP/1.1
+Host: api.uat.claconnect.com
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 6
+Transfer-Encoding: chunked
+
+0
+
+GET /admin HTTP/1.1
+X: 

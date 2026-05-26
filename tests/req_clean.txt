@@ -1,0 +1,5 @@
+GET /data/identity/applications HTTP/1.1
+Host: api.uat.claconnect.com
+User-Agent: smuggler/2.0
+Accept: */*
+
