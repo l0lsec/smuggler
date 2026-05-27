@@ -940,7 +940,7 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 			ui.icon("bug_report", size="32px").classes("text-cyan-500")
 			with ui.column().classes("gap-0"):
 				ui.label("Smuggler").classes("text-2xl font-bold")
-				ui.label("HTTP Request Smuggling / Desync scanner - web GUI") \
+				ui.label("HTTP Request Smuggling / Desync scanner - Web GUI") \
 					.classes("text-xs text-gray-500")
 		ui.link("github / @l0lsec", "https://github.com/l0lsec/smuggler", new_tab=True) \
 			.classes("text-xs text-gray-400")
