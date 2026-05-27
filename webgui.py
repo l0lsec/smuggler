@@ -414,6 +414,139 @@ def human_size(n: int) -> str:
 	return f"{n:.1f} TB"
 
 
+# ---------------------------------------------------------------------------
+# Payload introspection helpers
+# ---------------------------------------------------------------------------
+#
+# Smuggler dumps payload files into ./payloads/ on every CRITICAL finding.
+# The filename encodes scheme + host + scan type + mutation, e.g.
+#   https_eprocurement_phoenix_gov_CLTE_xprespace-0a.txt
+# The bytes that *cause* the desync (bare LF, tab, 0x09, 0xa0, etc.) are
+# invisible in a plain text view, so the GUI needs a hex view too.
+
+def _parse_payload_meta(path: Path) -> dict:
+	"""Read a payload file and pull out the bits the GUI needs.
+
+	Returns a dict with: raw (bytes), scheme, port, host, scan_type, mutation.
+	`host` is parsed from the Host: header inside the file (more reliable
+	than reverse-engineering the underscored hostname in the filename).
+	"""
+	try:
+		raw = path.read_bytes()
+	except OSError:
+		raw = b""
+	scheme = "https" if path.name.lower().startswith("https_") else "http"
+	port = 443 if scheme == "https" else 80
+	host: Optional[str] = None
+	# Walk the header block (up to the first blank line) looking for Host:.
+	for line in raw.split(b"\n", 200):
+		stripped = line.rstrip(b"\r")
+		if not stripped:
+			break
+		if b":" in stripped:
+			k, _, v = stripped.partition(b":")
+			if k.strip().lower() == b"host":
+				host = v.strip().decode("ascii", errors="replace")
+				break
+	# Filename pattern is <scheme>_<host>_<scan>_<mutation>.txt; mutation can
+	# contain hyphens (e.g. "xprespace-0a") so we work from the right.
+	stem = path.stem
+	parts = stem.split("_")
+	scan_type = parts[-2] if len(parts) >= 3 else "?"
+	mutation = parts[-1] if len(parts) >= 2 else "?"
+	return {
+		"raw": raw,
+		"scheme": scheme,
+		"port": port,
+		"host": host,
+		"scan_type": scan_type,
+		"mutation": mutation,
+	}
+
+
+def _render_text_html(raw: bytes) -> str:
+	"""Render bytes as text, with every non-printable byte highlighted.
+
+	The point of the highlight is that the *single byte* that causes a CL.TE
+	mutation (0x09 tab, 0x0a bare LF, 0xa0, etc.) becomes immediately
+	visible -- which is exactly the bit you'd otherwise miss skimming the
+	payload in a browser tab.
+	"""
+	out: list[str] = []
+	hl = 'background:#7c2d12;color:#fde68a;border-radius:2px;padding:0 2px;margin:0 1px'
+	for b in raw:
+		if b == 0x0a:
+			out.append(f'<span style="{hl}" title="LF (0x0a)">\\n</span>\n')
+		elif b == 0x0d:
+			out.append(f'<span style="{hl}" title="CR (0x0d)">\\r</span>')
+		elif b == 0x09:
+			out.append(f'<span style="{hl}" title="TAB (0x09)">\\t</span>')
+		elif 0x20 <= b < 0x7f:
+			out.append(html.escape(chr(b)))
+		else:
+			out.append(f'<span style="{hl}" title="0x{b:02x}">\\x{b:02x}</span>')
+	return "".join(out)
+
+
+def _render_hex_html(raw: bytes) -> str:
+	"""Standard 16-byte-wide hex dump with non-printables emphasized.
+
+	Cells are always exactly 2 visible chars (or 2 spaces) so the column
+	alignment survives even though we wrap weird bytes in <span> tags.
+	"""
+	hl = 'color:#fde68a;font-weight:600'
+	lines: list[str] = []
+	for off in range(0, len(raw), 16):
+		chunk = raw[off:off + 16]
+		cells: list[str] = []
+		for i in range(16):
+			if i < len(chunk):
+				b = chunk[i]
+				hi = f"{b:02x}"
+				if b in (0x09, 0x0a, 0x0d) or not (0x20 <= b < 0x7f):
+					cell = f'<span style="{hl}">{hi}</span>'
+				else:
+					cell = hi
+			else:
+				cell = "  "
+			cells.append(cell)
+		left = " ".join(cells[:8])
+		right = " ".join(cells[8:])
+		ascii_cells: list[str] = []
+		for b in chunk:
+			if 0x20 <= b < 0x7f:
+				ascii_cells.append(html.escape(chr(b)))
+			else:
+				ascii_cells.append('<span style="color:#9ca3af">.</span>')
+		ascii_str = "".join(ascii_cells)
+		lines.append(
+			f'<span style="color:#9ca3af">{off:08x}</span>  '
+			f'{left}  {right}  |{ascii_str}|'
+		)
+	return "\n".join(lines)
+
+
+def _repro_cmd_for_payload(path: Path, meta: dict) -> str:
+	"""Build a shell one-liner that sends the payload verbatim on the wire.
+
+	Crucial: no `-crlf` on openssl. That option converts every \\n on stdin
+	into \\r\\n, which would destroy the bare-LF / lone-CR bytes that make
+	the HRS payload work. The `sleep 5` keeps the connection open so we can
+	observe the response (or a hanging socket, which itself proves the
+	desync). Adjust the sleep to taste.
+	"""
+	host = meta.get("host") or "TARGET_HOST"
+	port = meta["port"]
+	pquoted = shlex.quote(str(path))
+	if meta["scheme"] == "https":
+		return (
+			f"(cat {pquoted}; sleep 5) | "
+			f"openssl s_client -quiet -connect {host}:{port} "
+			f"-servername {host}"
+		)
+	return f"(cat {pquoted}; sleep 5) | ncat --no-shutdown {host} {port}"
+
+
 @ui.page("/")
 def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bottom
 	ui.add_head_html(f"<style>{LOG_CSS}</style>")
@@ -422,6 +555,17 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 	# UI handles captured by closures further down
 	log_html_chunks: list[str] = []
 	log_view: dict = {}
+	# Shared mutable state for the payloads card: which files we've already
+	# rendered, and which ones appeared after the most recent on_start()
+	# (so we can flag them as "NEW" and notify).
+	payload_state: dict = {
+		"known": set(),         # all filenames ever seen since page load
+		"new": set(),           # filenames added since the last run started
+		"last_signature": None, # (count, max-mtime) — cheap change detector
+	}
+	# Handles the payload row callbacks need to mutate. Populated as the
+	# form widgets are constructed below.
+	ui_handles: dict = {}
 
 	# ---- Header ---------------------------------------------------------
 	with ui.row().classes("w-full items-center justify-between"):
@@ -505,6 +649,10 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 							req_inline_row.set_visibility(cfg.request_source == "inline")
 						req_source.on_value_change(lambda _e: _toggle_req_panels())
 						_toggle_req_panels()
+						# Expose the request-source widgets so the Payloads
+						# card can stage "Replay this payload" with one click.
+						ui_handles["req_source"] = req_source
+						ui_handles["toggle_req_panels"] = _toggle_req_panels
 
 				def _on_target_tab(e):
 					# NiceGUI 3.x passes the tab `name` as a plain string;
@@ -519,6 +667,7 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 					if name in {"url", "list", "request"}:
 						cfg.mode = name
 				target_tabs.on_value_change(_on_target_tab)
+				ui_handles["target_tabs"] = target_tabs
 
 			# --- Mode / toggles -----
 			with ui.card().classes("w-full"):
@@ -526,6 +675,7 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 				with ui.row().classes("w-full gap-4 flex-wrap"):
 					replay_sw = ui.switch("Replay mode (sends request verbatim, loops until Stop)") \
 						.bind_value(cfg, "replay")
+					ui_handles["replay_sw"] = replay_sw
 					ui.switch("Persistent connection") \
 						.bind_value(cfg, "persistent_connection")
 					ui.switch("Exit on first finding").bind_value(cfg, "exit_early")
@@ -731,7 +881,7 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 		status_label.set_text(f"Exited (rc={rc})")
 		start_btn.set_visibility(True)
 		stop_btn.set_visibility(False)
-		refresh_payloads()
+		refresh_payloads(force=True)
 		ui.notify(f"Smuggler finished (exit code {rc})",
 			type="positive" if rc == 0 else "warning")
 
@@ -766,6 +916,16 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 		start_btn.set_visibility(False)
 		stop_btn.set_visibility(True)
 		replay_card.set_visibility(cfg.replay)
+		# Snapshot the payloads dir so anything that appears during this run
+		# is flagged as NEW (and announced via ui.notify) by the periodic
+		# refresher below.
+		payload_state["new"] = set()
+		try:
+			payload_state["known"] = {p.name for p in PAYLOADS_DIR.glob("*.txt")}
+		except OSError:
+			payload_state["known"] = set()
+		payload_state["last_signature"] = None
+		refresh_payloads()
 
 		state.task = asyncio.create_task(stream_process(
 			cfg, argv, push_log, push_status, on_exit, state,
@@ -777,15 +937,130 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 	start_btn.on_click(on_start)
 	stop_btn.on_click(on_stop)
 
-	# ---- Payloads listing ----
-	def refresh_payloads():
-		payloads_box.clear()
-		if not PAYLOADS_DIR.exists():
-			with payloads_box:
-				ui.label("(no payloads/ directory yet)").classes("text-xs text-gray-500")
+	# ---- Payload viewer dialog (built once, reused per click) ----
+	#
+	# We render two views: a text view with non-printables highlighted (the
+	# "what byte makes this work" view) and a classic hex dump. Findings
+	# almost always hinge on a single byte that's invisible in plain text,
+	# so the text view alone is misleading.
+	with ui.dialog() as payload_dlg, ui.card().classes("w-[960px] max-w-[95vw]"):
+		pd_title = ui.label("").classes("text-base font-semibold font-mono break-all")
+		pd_meta = ui.label("").classes("text-xs text-gray-500")
+		ui.separator()
+		with ui.tabs().classes("w-full") as pd_tabs:
+			pd_tab_text = ui.tab("text", label="Annotated text")
+			pd_tab_hex = ui.tab("hex", label="Hex dump")
+		with ui.tab_panels(pd_tabs, value=pd_tab_text).classes("w-full"):
+			with ui.tab_panel(pd_tab_text):
+				pd_text = ui.html("", sanitize=False).classes(
+					"smug-log w-full whitespace-pre-wrap")
+			with ui.tab_panel(pd_tab_hex):
+				pd_hex = ui.html("", sanitize=False).classes(
+					"smug-log w-full whitespace-pre")
+		ui.separator()
+		with ui.row().classes("w-full justify-between items-center"):
+			pd_repro = ui.label("").classes(
+				"text-[11px] font-mono text-gray-500 break-all flex-grow")
+			with ui.row().classes("gap-2"):
+				pd_copy_btn = ui.button("Copy repro cmd", icon="content_copy") \
+					.props("flat dense")
+				ui.button("Close", on_click=payload_dlg.close).props("flat")
+
+	def view_payload(path: Path) -> None:
+		meta = _parse_payload_meta(path)
+		pd_title.set_text(path.name)
+		pd_meta.set_text(
+			f"{meta['scheme']}://{meta.get('host') or '?'}:{meta['port']}"
+			f"   |   scan: {meta['scan_type']}   |   mutation: {meta['mutation']}"
+			f"   |   {len(meta['raw'])} bytes"
+		)
+		pd_text.content = _render_text_html(meta["raw"])
+		pd_hex.content = _render_hex_html(meta["raw"])
+		repro = _repro_cmd_for_payload(path, meta)
+		pd_repro.set_text("$ " + repro)
+		pd_copy_btn.on_click(lambda _=None, c=repro: (
+			ui.run_javascript(f"navigator.clipboard.writeText({_js_str(c)})"),
+			ui.notify("Reproduction command copied"),
+		))
+		payload_dlg.open()
+
+	def stage_replay(path: Path) -> None:
+		"""Wire the form up so 'Start' will replay this payload verbatim.
+
+		Doesn't auto-start — the user may still want to set --proxy,
+		--persistent-connection, or a baseline before running.
+		"""
+		if state.is_running():
+			ui.notify(
+				"A scan is already running — stop it before staging a replay.",
+				type="warning")
 			return
-		files = sorted(PAYLOADS_DIR.glob("*.txt"),
-			key=lambda p: p.stat().st_mtime, reverse=True)
+		cfg.mode = "request"
+		cfg.request_source = "path"
+		cfg.request_path = str(path)
+		cfg.replay = True
+		# Force the UI widgets to reflect the new cfg (binding alone can lag
+		# by one tick, and we want the user's next click to Just Work).
+		tt = ui_handles.get("target_tabs")
+		if tt is not None:
+			tt.set_value("request")
+		rs = ui_handles.get("req_source")
+		if rs is not None:
+			rs.set_value("path")
+		tog = ui_handles.get("toggle_req_panels")
+		if tog is not None:
+			tog()
+		rsw = ui_handles.get("replay_sw")
+		if rsw is not None:
+			rsw.value = True
+		ui.notify(f"Staged {path.name} for replay — press Start.",
+			type="positive")
+
+	def copy_repro(path: Path) -> None:
+		meta = _parse_payload_meta(path)
+		cmd = _repro_cmd_for_payload(path, meta)
+		ui.run_javascript(f"navigator.clipboard.writeText({_js_str(cmd)})")
+		ui.notify("Reproduction command copied")
+
+	# ---- Payloads listing ----
+	def refresh_payloads(force: bool = False) -> None:
+		"""Rebuild the payloads card.
+
+		Called manually (Refresh button, on_exit) and periodically while a
+		scan is running. `force=False` is a no-op when nothing on disk has
+		changed since last render, so the 2-second auto-refresh timer
+		doesn't churn the DOM on every tick.
+		"""
+		if not PAYLOADS_DIR.exists():
+			payloads_box.clear()
+			with payloads_box:
+				ui.label("(no payloads/ directory yet)") \
+					.classes("text-xs text-gray-500")
+			return
+		try:
+			files = sorted(PAYLOADS_DIR.glob("*.txt"),
+				key=lambda p: p.stat().st_mtime, reverse=True)
+		except OSError:
+			files = []
+		signature = (
+			len(files),
+			max((p.stat().st_mtime for p in files), default=0.0),
+		)
+		# Detect newly-arrived payloads (relative to the snapshot taken at
+		# on_start) so we can flag + announce them.
+		current_names = {p.name for p in files}
+		known = payload_state["known"]
+		fresh = current_names - known
+		if fresh and state.is_running():
+			for name in sorted(fresh):
+				ui.notify(f"New payload: {name}", type="positive")
+				payload_state["new"].add(name)
+		payload_state["known"] = current_names
+		if (not force) and signature == payload_state["last_signature"]:
+			return
+		payload_state["last_signature"] = signature
+
+		payloads_box.clear()
 		if not files:
 			with payloads_box:
 				ui.label("No payload files yet. Run a scan to populate.") \
@@ -794,15 +1069,48 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 		with payloads_box:
 			for p in files[:200]:
 				st = p.stat()
-				mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime))
+				mtime = time.strftime("%Y-%m-%d %H:%M:%S",
+					time.localtime(st.st_mtime))
+				is_new = p.name in payload_state["new"]
 				with ui.row().classes("w-full items-center no-wrap gap-2"):
 					ui.icon("description").classes("text-cyan-500")
-					ui.label(p.name).classes("font-mono text-xs flex-grow truncate")
-					ui.label(f"{human_size(st.st_size)} - {mtime}") \
-						.classes("text-[10px] text-gray-500")
-					ui.link("download", f"/payloads/{p.name}").props("target=_blank") \
-						.classes("text-xs")
-	refresh_payloads()
+					with ui.column().classes("gap-0 flex-grow min-w-0"):
+						with ui.row().classes("items-center gap-2 no-wrap"):
+							ui.label(p.name).classes(
+								"font-mono text-xs truncate")
+							if is_new:
+								ui.badge("NEW", color="positive") \
+									.classes("text-[10px]")
+						ui.label(f"{human_size(st.st_size)} • {mtime}") \
+							.classes("text-[10px] text-gray-500")
+					# Captured-by-default lambdas would all close over the
+					# loop variable; use default-arg trick to bind per-row.
+					ui.button(icon="visibility",
+						on_click=lambda _=None, pp=p: view_payload(pp)) \
+						.props("flat dense round").tooltip("View (text + hex)")
+					ui.button(icon="replay",
+						on_click=lambda _=None, pp=p: stage_replay(pp)) \
+						.props("flat dense round") \
+						.tooltip("Stage as --replay request")
+					ui.button(icon="terminal",
+						on_click=lambda _=None, pp=p: copy_repro(pp)) \
+						.props("flat dense round") \
+						.tooltip("Copy openssl/ncat reproduction command")
+					ui.button(icon="download",
+						on_click=lambda _=None, n=p.name: ui.run_javascript(
+							f"window.open('/payloads/{n}', '_blank')"
+						)) \
+						.props("flat dense round") \
+						.tooltip("Download raw bytes")
+
+	# Poll while a run is in progress so freshly-dumped payloads appear
+	# (and get flagged NEW) without waiting for the run to finish.
+	def _maybe_refresh_payloads() -> None:
+		if state.is_running():
+			refresh_payloads(force=False)
+	ui.timer(2.0, _maybe_refresh_payloads)
+
+	refresh_payloads(force=True)
 
 
 def resolve_request_files_dry(cfg: RunConfig) -> tuple[Optional[str], Optional[str]]:

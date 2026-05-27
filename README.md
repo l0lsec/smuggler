@@ -259,41 +259,6 @@ specify configuration files using the -c/--configfile \<configfile> command line
 ## Payloads Directory
 Inside the Smuggler directory is the payloads directory. When Smuggler finds a potential CLTE or TECL desync issue, it will automatically dump a binary txt file of the problematic payload in the payloads directory. All payload filenames are annotated with the hostname, desync type and mutation type. Use these payloads to netcat directly to the server or to import into other analysis tools.
 
-## Test Files
-
-The `tests/` directory contains example request files. **They are NOT
-interchangeable — the right file depends on the mode you're invoking.**
-
-| File | Intended mode | What it is |
-| --- | --- | --- |
-| `req_clean.txt` | `-r` (scan mode) | A vanilla GET. Smuggler extracts only the target (method/endpoint/host/cookies) and synthesizes its own smuggling payloads from the chosen config. **This is what most users want.** |
-| `req_poc.txt` | `-r --replay` | A deliberate CL.TE-style smuggling POC. Sent verbatim by `--replay`; useless as a scan template (body and embedded request line are ignored in scan mode). |
-| `req1.txt`, `req2.txt`, `req3.txt` | `-r --replay` (legacy) | Pre-existing POC-shaped examples. The new scan-mode validator will warn you if you pass these without `--replay`. |
-| `baseline_test.txt` | `--baseline-request` | Sample baseline used in conjunction with a smuggling POC during `--replay`. |
-
-### Why the distinction matters
-
-In scan mode the request file is **only a template**. Smuggler reads:
-
-- `method`, `endpoint`, `host`, `cookies`
-
-…and ignores everything else (body, extra headers, embedded request lines).
-Smuggling payloads are synthesized from the config (`configs/default.py`
-etc.) and from the scanner classes themselves. Pasting a Burp POC into
-`-r` *without* `--replay` will not send the POC on the wire.
-
-The tool now emits a `Notice:` warning when it detects body bytes or
-POC-shaped content in a scan-mode request file, with a hint to use
-`--replay` or `--baseline-request` instead.
-
-### `--baseline-request` requirements
-
-The baseline request is sent verbatim alongside (after) the smuggling
-request for differential analysis. It must be a **clean, well-formed
-request**. The validator emits warnings for baseline files too,
-regardless of mode, since a POC-shaped baseline produces a meaningless
-comparison.
-
 ## Detection Capability Matrix
 
 The table below maps each attack class to the scanner that implements it,
