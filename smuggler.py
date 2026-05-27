@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # MIT License
 # 
-# Copyright (c) 2020 Evan Custodio
+# Copyright (c) 2026 Sedric Louissaint
 # 
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
