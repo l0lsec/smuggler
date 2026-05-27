@@ -526,6 +526,340 @@ def _render_hex_html(raw: bytes) -> str:
 	return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Finding classification
+# ---------------------------------------------------------------------------
+#
+# Smuggler emits findings as plain stdout lines. We parse them here into a
+# Finding dataclass that the GUI can render into a structured panel. Two
+# buckets matter for the operator:
+#
+#   - "confirmed": scanner had an intrinsic oracle that fired (gadget hit,
+#     3-of-5 / 2-of-3 confirmation, status flip on hop-by-hop, parser
+#     discrepancy on canary, etc). High confidence, ready to escalate.
+#   - "potential": single-signal heuristic (timing-only TECL/CLTE,
+#     keep-alive header-removal, Expect variant) where the scanner can't
+#     prove it. Operator needs to confirm manually before reporting.
+
+# Pattern -> (extract confidence, extract scan label) per smuggler emission.
+# Pattern matching is deliberately strict: only lines that exactly look like
+# a known finding-emission shape are picked up, so we don't classify the
+# progress chatter as findings.
+
+def _norm_label(raw: str) -> str:
+	"""Canonicalize the scan label for grouping + lookup."""
+	m = {
+		"CLTE": "CLTE", "TECL": "TECL",
+		"CL.0": "CL.0", "0.CL": "CL.0", "TE.0": "TE.0",
+		"bare-LF": "BareLF", "bare-CR": "BareCR",
+		"pause-based": "Pause", "Pause": "Pause",
+		"Expect-based": "Expect", "Expect": "Expect",
+		"header removal": "HdrRemoval", "HdrRemoval": "HdrRemoval",
+		"ConnState": "ConnState", "ParserDisc": "ParserDisc",
+		"HopByHop": "HopByHop", "HTTP/2": "H2", "H2": "H2",
+	}
+	return m.get(raw, raw)
+
+
+def _classify_clte_tecl(m, line: str) -> tuple[str, str]:
+	conf = "confirmed" if (m.group(1) == "CONFIRMED" or "[gadget=" in line) else "potential"
+	return conf, m.group(2)
+
+
+_FINDING_PATTERNS: list = [
+	(re.compile(r"(CONFIRMED|Potential)\s+(CLTE|TECL)\s+Issue Found"),
+		_classify_clte_tecl),
+	(re.compile(r"Confirmed\s+(CL\.0|0\.CL|TE\.0)\s+desync"),
+		lambda m, _line: ("confirmed", _norm_label(m.group(1)))),
+	(re.compile(r"Confirmed\s+(bare-LF|bare-CR)\s+chunked\s+desync"),
+		lambda m, _line: ("confirmed", _norm_label(m.group(1)))),
+	(re.compile(r"Potential pause-based desync confirmed"),
+		lambda _m, _line: ("confirmed", "Pause")),
+	(re.compile(r"Connection state (?:discrepancy|reflection diff)"),
+		lambda _m, _line: ("confirmed", "ConnState")),
+	(re.compile(r"Discrepancy:\s+\S+\s+via"),
+		lambda _m, _line: ("confirmed", "ParserDisc")),
+	(re.compile(r"Front-end strips\s+\S+:"),
+		lambda _m, _line: ("confirmed", "HopByHop")),
+	(re.compile(r"Potential Expect-based desync"),
+		lambda _m, _line: ("potential", "Expect")),
+	(re.compile(r"Potential header removal vulnerability"),
+		lambda _m, _line: ("potential", "HdrRemoval")),
+]
+
+# CRITICAL/Payload line emitted immediately after each finding (smuggler
+# always calls write_fn after print_fn on success). We pair findings to
+# payloads using the most-recent-unpaired-finding rule.
+_PAYLOAD_LINE_RE = re.compile(r"Payload:\s+(\S+\.txt)\s+URL:\s+(\S+)")
+
+
+def classify_finding(line: str) -> Optional[tuple[str, str]]:
+	for rx, fn in _FINDING_PATTERNS:
+		m = rx.search(line)
+		if m:
+			return fn(m, line)
+	return None
+
+
+@dataclass
+class Finding:
+	id: str
+	ts: float
+	confidence: str   # "confirmed" | "potential"
+	scan: str         # normalized label (CLTE, CL.0, ParserDisc, ...)
+	line: str         # full ANSI-stripped finding line (description)
+	url: str = ""
+	payload_path: str = ""
+	payload_name: str = ""
+
+
+# Per-scan-class confirmation playbook. Each entry is a list of markdown
+# bullets. {payload}, {host}, {port}, {scheme}, {url} get formatted in.
+# Keep it tight: each step should be something the operator can copy/paste
+# or do in <2 minutes. The point is "what evidence makes this real".
+
+_STEPS_GENERIC_REPRO = (
+	"Reproduce the payload byte-exact on the wire (no `-crlf` — it would "
+	"convert bare LFs in the payload):\n"
+	"```\n"
+	"(cat {payload}; sleep 5) | openssl s_client -quiet -connect {host}:{port} "
+	"-servername {host}\n"
+	"```\n"
+	"A hanging socket or a 4xx/5xx on the *second* request through the "
+	"connection is the desync signal."
+)
+
+_STEPS_REPLAY = (
+	"Replay the payload through smuggler with a clean baseline and watch the "
+	"timing distribution:\n"
+	"```\n"
+	"python3 smuggler.py -r {payload} --baseline-request tests/req_clean.txt --replay\n"
+	"```\n"
+	"Look for the smuggling request consistently timing out / 4xx-ing while "
+	"the baseline returns 2xx on a fresh connection."
+)
+
+CONFIRMATION_STEPS: dict[str, list[str]] = {
+	# --- Potential (manual confirmation actually required) -----------------
+	"CLTE_potential": [
+		_STEPS_GENERIC_REPRO,
+		_STEPS_REPLAY,
+		"Run with `--persistent-connection` to surface request-pair effects "
+		"and rule out a transient timeout.",
+		"Repeat at least 20 times. A timing-only finding needs a "
+		"deterministic >2x gap between smuggling and baseline to be credible.",
+		"Try the same mutation with `-c configs/exhaustive.py` to see if "
+		"adjacent mutations (`prespace-09`, `endspace-0a`, etc.) also fire — "
+		"a single isolated mutation hitting is sometimes a parser quirk, "
+		"a cluster is strong evidence.",
+	],
+	"TECL_potential": [
+		_STEPS_GENERIC_REPRO,
+		_STEPS_REPLAY,
+		"Run with `--persistent-connection`. TECL desyncs often only show up "
+		"when the front-end keeps the back-end socket alive.",
+		"Repeat ≥20 times and compare timing distributions; flag only if the "
+		"gap is reproducible.",
+	],
+	"Expect_potential": [
+		"Re-issue the exact Expect variant manually with `curl --http1.1 -v "
+		"-H 'Expect: <value>' {url}` and compare the status / headers to a "
+		"vanilla request.",
+		"Try the full ladder: `Expect: 100-continue`, `Expect: y 100-continue`, "
+		"`Expect:`, `Expect:  100-continue` (two spaces).",
+		_STEPS_GENERIC_REPRO,
+		"In Burp's Repeater, send the variant followed by a pipelined victim "
+		"request on the same connection and check whether the victim "
+		"response reflects the Expect probe.",
+	],
+	"HdrRemoval_potential": [
+		"Re-run with `-q --scan-type header-removal --persistent-connection` "
+		"and confirm ≥3 of the 5 paired probes still diverge.",
+		"Manually send the harmless paired request, then the attack paired "
+		"request, on the same keep-alive connection. The attack pair should "
+		"strip a header that the harmless pair didn't.",
+		"Likely impact: try smuggling security headers (`X-Forwarded-For`, "
+		"`Authorization`, `Cookie`) — if the front-end strips them, the "
+		"back-end will trust client-supplied values.",
+	],
+
+	# --- Confirmed (impact-demo playbook) ---------------------------------
+	"CLTE_confirmed": [
+		"Already confirmed via the /robots.txt gadget oracle — the smuggled "
+		"request surfaced on a victim socket. This is real.",
+		"Build the impact PoC: replace the smuggled `GET /robots.txt` in the "
+		"payload with one of (in escalating impact order):\n"
+		"  - a request whose response gets cached against a high-value URL "
+		"(cache poisoning)\n"
+		"  - a `POST` with oversized `Content-Length` that captures the next "
+		"victim's `Cookie:` / `Authorization:` into a reflective parameter\n"
+		"  - a request to an edge-blocked path (`/admin`, actuator, internal IP)",
+		"For a `.gov` / production target, use a **self-collision** PoC: two "
+		"of your own sessions on two of your own IPs, prove A receives B's "
+		"response. Capture pcaps. No third-party impact required.",
+		"Use Burp's HTTP Request Smuggler extension (or "
+		"defparam/tiscripts DesyncAttack_CLTE.py) to stage the multi-request "
+		"attack.",
+	],
+	"TECL_confirmed": [
+		"Already confirmed via gadget oracle — real.",
+		"Same escalation ladder as CLTE: cache poison → credential capture → "
+		"front-end control bypass. Self-collision PoC preferred for "
+		"production targets.",
+		"Try `defparam/tiscripts/DesyncAttack_TECL.py` for staging.",
+	],
+	"CL.0_confirmed": [
+		"Already confirmed via 3-of-5 pipelined victim oracle. Real.",
+		"Impact demo: smuggle a request to a path the **front-end blocks but "
+		"the back-end serves** — actuators, `/admin`, internal-only servlets. "
+		"This is the cleanest CL.0 impact story.",
+		"Verify with two parallel connections — attacker connection sends "
+		"the smuggling request, victim connection sends a normal request, "
+		"victim response leaks the smuggled response body or headers.",
+	],
+	"TE.0_confirmed": [
+		"Already confirmed via 3-of-5 pipelined victim oracle. Real.",
+		"Same impact ladder as CL.0 — typically front-end bypass.",
+	],
+	"BareLF_confirmed": [
+		"Already confirmed via 3-of-5 pipelined victim oracle on bare-LF "
+		"chunk framing. Real.",
+		"Document the exact byte: the framing must use `\\n` (0x0a) without "
+		"the preceding `\\r` in the chunk-size terminator. Most fixes are "
+		"a single line of front-end config.",
+		"Impact demo: same as CL.0/TE.0 — front-end control bypass or "
+		"victim hijacking.",
+	],
+	"BareCR_confirmed": [
+		"Already confirmed via 3-of-5 oracle on bare-CR framing.",
+		"Same playbook as bare-LF.",
+	],
+	"Pause_confirmed": [
+		"Confirmed via 2-of-3 reproducibility on the pause-based oracle.",
+		"Note: the pause window is per-connection. Some CDNs only have this "
+		"window for the *first* request on a fresh socket — re-test with "
+		"`--persistent-connection` off to confirm whether subsequent "
+		"requests still desync.",
+		"Impact: classic CL.TE/TE.CL desync once the back-end has consumed "
+		"the smuggled prefix. Same escalation ladder.",
+	],
+	"ConnState_confirmed": [
+		"Confirmed via direct-vs-pipelined status flip. Real.",
+		"Impact: the back-end pins state (auth, host routing, TLS context) "
+		"to the *first* request on a connection — second request through "
+		"the same socket inherits that state. Try smuggling a request that "
+		"would be rejected on its own but is accepted in the back-end's "
+		"first-request context.",
+		"Re-test on a fresh socket vs after a known harmless request to "
+		"confirm the binding.",
+	],
+	"ParserDisc_confirmed": [
+		"Confirmed via baseline + canary technique. Real.",
+		"Re-issue the exact technique + canary manually (Burp Repeater) and "
+		"verify the status diff reproduces ≥3 times in a row.",
+		"Impact depends on which technique fired — see the description "
+		"line. Generally a parser-discrepancy is a stepping stone: it "
+		"proves front-end and back-end disagree, which is the necessary "
+		"condition for a follow-up smuggling/cache attack.",
+	],
+	"HopByHop_confirmed": [
+		"Confirmed via 2-of-3 status flip when the named header is listed "
+		"in `Connection:`. Real.",
+		"Impact: front-end strips the header before it reaches the back-end. "
+		"Now try smuggling `Connection: Authorization` (strips client auth), "
+		"`Connection: X-Forwarded-For` (smuggles client IP), `Connection: "
+		"X-Forwarded-Proto`, `Connection: Cookie`. Each unlocks a separate "
+		"bypass class.",
+		"Document with `curl` paired requests so the triager can replay.",
+	],
+	"H2_confirmed": [
+		"Confirmed via parallel H1 victim oracle — the smuggled HTTP/1.1 "
+		"prefix surfaced on a separate H1 connection. Real.",
+		"Impact: H2-to-H1 downgrade smuggling. The H2 frontend forwarded "
+		"a smuggling-capable H1 stream to the back-end. Same impact ladder "
+		"as CL.TE.",
+	],
+}
+
+
+def confirmation_steps_for(finding: Finding) -> list[str]:
+	"""Return the playbook for this finding, formatted with its context."""
+	key = f"{finding.scan}_{finding.confidence}"
+	steps = CONFIRMATION_STEPS.get(key) or CONFIRMATION_STEPS.get(
+		f"{finding.scan}_confirmed", [])
+	if not steps:
+		# Last-resort generic playbook so we never render an empty section.
+		steps = [_STEPS_GENERIC_REPRO, _STEPS_REPLAY]
+	# Format-string substitution
+	meta = {"payload": "<no-payload>", "host": "TARGET_HOST",
+		"port": 443, "scheme": "https", "url": finding.url or "TARGET_URL"}
+	if finding.payload_path:
+		pmeta = _parse_payload_meta(Path(finding.payload_path))
+		meta.update({
+			"payload": shlex.quote(finding.payload_path),
+			"host": pmeta.get("host") or "TARGET_HOST",
+			"port": pmeta["port"],
+			"scheme": pmeta["scheme"],
+		})
+	out: list[str] = []
+	for step in steps:
+		try:
+			out.append(step.format(**meta))
+		except (KeyError, IndexError):
+			out.append(step)
+	return out
+
+
+def render_findings_markdown(findings: list[Finding], argv: list[str]) -> str:
+	"""Triage-ready Markdown report. Confirmed first, then Potential."""
+	confirmed = [f for f in findings if f.confidence == "confirmed"]
+	potential = [f for f in findings if f.confidence == "potential"]
+	ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+	lines: list[str] = []
+	lines.append(f"# Smuggler findings report — {ts}")
+	lines.append("")
+	if argv:
+		lines.append("Invocation:")
+		lines.append("```")
+		lines.append("$ " + " ".join(shlex.quote(a) for a in argv))
+		lines.append("```")
+		lines.append("")
+	lines.append(f"**Summary:** {len(confirmed)} confirmed, "
+		f"{len(potential)} need manual confirmation.")
+	lines.append("")
+
+	def _emit(section: str, bucket: list[Finding]) -> None:
+		lines.append(f"## {section} ({len(bucket)})")
+		lines.append("")
+		if not bucket:
+			lines.append("_None._")
+			lines.append("")
+			return
+		for i, f in enumerate(bucket, 1):
+			lines.append(f"### {i}. {f.scan} — {f.line.strip()}")
+			lines.append("")
+			if f.url:
+				lines.append(f"- URL: `{f.url}`")
+			if f.payload_path:
+				lines.append(f"- Payload: `{f.payload_path}`")
+			lines.append(f"- Detected: {time.strftime('%H:%M:%S', time.localtime(f.ts))}")
+			lines.append("")
+			lines.append("**Confirmation / escalation steps:**")
+			lines.append("")
+			for n, step in enumerate(confirmation_steps_for(f), 1):
+				# Markdown numbered-list with multi-line content; indent
+				# subsequent lines by 3 spaces.
+				step_lines = step.split("\n")
+				lines.append(f"{n}. {step_lines[0]}")
+				for sl in step_lines[1:]:
+					lines.append(f"   {sl}")
+			lines.append("")
+
+	_emit("Confirmed", confirmed)
+	_emit("Needs manual confirmation", potential)
+	return "\n".join(lines)
+
+
 def _repro_cmd_for_payload(path: Path, meta: dict) -> str:
 	"""Build a shell one-liner that sends the payload verbatim on the wire.
 
@@ -566,6 +900,12 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 	# Handles the payload row callbacks need to mutate. Populated as the
 	# form widgets are constructed below.
 	ui_handles: dict = {}
+	# Findings parsed out of smuggler's stdout in real time. Reset on Start.
+	findings: list[Finding] = []
+	# The most recent finding waiting for its CRITICAL/Payload pair line.
+	# Smuggler always calls write_fn() right after print_fn() on success, so
+	# the next "Payload: ... URL: ..." line we see belongs to this finding.
+	pending_finding: dict = {"f": None}
 
 	# ---- Header ---------------------------------------------------------
 	with ui.row().classes("w-full items-center justify-between"):
@@ -808,6 +1148,21 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 				latest_id_lbl = ui.label("").classes("text-[10px] text-gray-500")
 			replay_card.set_visibility(False)
 
+			# --- Findings -----
+			# Real-time triage panel. Parsed from smuggler stdout into two
+			# buckets: high-confidence (oracle fired) and "needs manual
+			# confirmation" (single-signal heuristic).
+			with ui.card().classes("w-full"):
+				with ui.row().classes("w-full items-center justify-between"):
+					ui.label("Findings").classes("text-base font-semibold")
+					with ui.row().classes("gap-2 items-center"):
+						findings_summary = ui.label("0 confirmed • 0 to confirm") \
+							.classes("text-xs text-gray-500")
+						ui.button("Copy as Markdown", icon="article",
+							on_click=lambda: _export_findings_md()) \
+							.props("flat dense")
+				findings_box = ui.column().classes("w-full gap-2")
+
 			# --- Output log -----
 			with ui.card().classes("w-full"):
 				with ui.row().classes("w-full items-center justify-between"):
@@ -839,6 +1194,9 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 	def push_log(text: str) -> None:
 		if not text:
 			return
+		# Parse before mutating HTML — findings panel is the user-facing
+		# output, log is the debug view.
+		_record_finding_from_line(text)
 		htm = ansi_to_html(text)
 		# Smuggler uses \r to redraw progress lines; keep them but render with
 		# a thin background so they're visibly distinct.
@@ -856,6 +1214,47 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 				"const el = document.querySelector('.smug-log');"
 				"if (el) { el.scrollTop = el.scrollHeight; }"
 			)
+
+	def _record_finding_from_line(text: str) -> None:
+		"""Pull Finding objects out of smuggler's stdout as it streams."""
+		stripped = ansi_strip(text).strip()
+		if not stripped:
+			return
+		# 1) Is this a finding header?
+		classified = classify_finding(stripped)
+		if classified is not None:
+			conf, scan = classified
+			# Pull the URL out of the line if it's a TECL/CLTE-shape message
+			url = ""
+			m = re.search(r"@\s+(https?://\S+)", stripped)
+			if m:
+				url = m.group(1).rstrip(",.;")
+			f = Finding(
+				id=uuid.uuid4().hex[:8],
+				ts=time.time(),
+				confidence=conf,
+				scan=_norm_label(scan),
+				line=stripped,
+				url=url,
+			)
+			findings.append(f)
+			pending_finding["f"] = f
+			rerender_findings()
+			label = "Confirmed" if conf == "confirmed" else "Needs manual confirm"
+			ui.notify(f"{label}: {f.scan} finding",
+				type="positive" if conf == "confirmed" else "warning")
+			return
+		# 2) Is this the CRITICAL/Payload line that pairs with the last finding?
+		mp = _PAYLOAD_LINE_RE.search(stripped)
+		if mp and pending_finding["f"] is not None:
+			f = pending_finding["f"]
+			payload_path = mp.group(1)
+			f.payload_path = payload_path
+			f.payload_name = os.path.basename(payload_path)
+			if not f.url:
+				f.url = mp.group(2)
+			pending_finding["f"] = None
+			rerender_findings()
 
 	def clear_log() -> None:
 		log_html_chunks.clear()
@@ -911,6 +1310,9 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 
 		argv = build_argv(cfg, req_path, baseline_path)
 		clear_log()
+		findings.clear()
+		pending_finding["f"] = None
+		rerender_findings()
 		push_log(f"\x1B[36m$ {' '.join(shlex.quote(a) for a in argv)}\x1B[0m\n")
 		status_label.set_text("Running...")
 		start_btn.set_visibility(False)
@@ -1022,6 +1424,155 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 		ui.run_javascript(f"navigator.clipboard.writeText({_js_str(cmd)})")
 		ui.notify("Reproduction command copied")
 
+	def _md_to_html(text: str) -> str:
+		"""Tiny markdown subset → HTML for the in-card step rendering.
+
+		Just `code fences`, `inline backticks`, and **bold**. Anything else
+		passes through escaped. Keeps us off a markdown dep for ~20 lines.
+		"""
+		out: list[str] = []
+		in_code = False
+		for raw_line in text.split("\n"):
+			if raw_line.strip() == "```":
+				if in_code:
+					out.append("</code></pre>")
+					in_code = False
+				else:
+					out.append('<pre style="background:#0b1020;color:#e5e7eb;'
+						'padding:8px;border-radius:4px;overflow-x:auto;'
+						'font-size:11px;margin:4px 0"><code>')
+					in_code = True
+				continue
+			if in_code:
+				out.append(html.escape(raw_line) + "\n")
+				continue
+			esc = html.escape(raw_line)
+			esc = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", esc)
+			esc = re.sub(r"`([^`]+)`",
+				r'<code style="background:rgba(148,163,184,0.18);'
+				r'padding:1px 4px;border-radius:3px;font-size:11px">\1</code>',
+				esc)
+			out.append(esc + "<br>")
+		if in_code:
+			out.append("</code></pre>")
+		return "".join(out)
+
+	def rerender_findings() -> None:
+		confirmed = [f for f in findings if f.confidence == "confirmed"]
+		potential = [f for f in findings if f.confidence == "potential"]
+		findings_summary.set_text(
+			f"{len(confirmed)} confirmed • {len(potential)} to confirm")
+		findings_box.clear()
+		if not findings:
+			with findings_box:
+				ui.label("No findings yet. Start a scan to populate.") \
+					.classes("text-xs text-gray-500")
+			return
+
+		def _render_section(title: str, color_cls: str, icon: str,
+				bucket: list[Finding]) -> None:
+			if not bucket:
+				return
+			with findings_box:
+				with ui.row().classes("w-full items-center gap-2 mt-1"):
+					ui.icon(icon).classes(color_cls)
+					ui.label(f"{title} ({len(bucket)})") \
+						.classes(f"text-sm font-semibold {color_cls}")
+				for f in bucket:
+					with ui.expansion(
+						f"{f.scan} — {f.line[:90]}"
+						+ ("..." if len(f.line) > 90 else ""),
+						icon=icon,
+					).classes("w-full").props(
+						"dense header-class=text-xs"):
+						# Body of the expanded panel
+						if f.url:
+							ui.label(f"URL: {f.url}") \
+								.classes("text-xs font-mono break-all")
+						with ui.row().classes("text-xs text-gray-500 gap-3"):
+							ui.label(time.strftime(
+								"%H:%M:%S", time.localtime(f.ts)))
+							ui.label(f"scan: {f.scan}")
+							ui.label(f"id: {f.id}")
+						ui.label(f.line) \
+							.classes("text-xs font-mono break-all whitespace-pre-wrap")
+						# Payload action row
+						if f.payload_path:
+							pname = f.payload_name or os.path.basename(
+								f.payload_path)
+							with ui.row().classes("w-full items-center gap-2 mt-1"):
+								ui.icon("description") \
+									.classes("text-cyan-500")
+								ui.label(pname) \
+									.classes("font-mono text-xs flex-grow truncate")
+								ui.button(
+									"View", icon="visibility",
+									on_click=lambda _=None,
+										p=Path(f.payload_path):
+										view_payload(p),
+								).props("flat dense")
+								ui.button(
+									"Replay", icon="replay",
+									on_click=lambda _=None,
+										p=Path(f.payload_path):
+										stage_replay(p),
+								).props("flat dense")
+								ui.button(
+									"Copy repro", icon="terminal",
+									on_click=lambda _=None,
+										p=Path(f.payload_path):
+										copy_repro(p),
+								).props("flat dense")
+						else:
+							ui.label("(no payload file paired)") \
+								.classes("text-xs text-gray-500 italic")
+						# Confirmation playbook
+						ui.separator()
+						ui.label(
+							"Confirmation steps"
+							if f.confidence == "potential"
+							else "Escalation steps"
+						).classes("text-xs font-semibold mt-1")
+						steps = confirmation_steps_for(f)
+						steps_md = "\n".join(
+							f"{i+1}. {s}" for i, s in enumerate(steps))
+						ui.html(_md_to_html(steps_md), sanitize=False) \
+							.classes("text-xs leading-relaxed")
+						with ui.row().classes("w-full justify-end gap-2 mt-1"):
+							single_md = render_findings_markdown(
+								[f], state.argv)
+							ui.button(
+								"Copy this finding (MD)",
+								icon="content_copy",
+								on_click=lambda _=None, md=single_md: (
+									ui.run_javascript(
+										f"navigator.clipboard.writeText("
+										f"{_js_str(md)})"),
+									ui.notify("Finding copied as Markdown"),
+								),
+							).props("flat dense")
+
+		_render_section("Confirmed", "text-red-500", "verified", confirmed)
+		_render_section(
+			"Needs manual confirmation", "text-amber-500",
+			"help_outline", potential)
+
+	def _export_findings_md() -> None:
+		if not findings:
+			ui.notify("No findings to export yet.", type="warning")
+			return
+		md = render_findings_markdown(findings, state.argv)
+		ui.run_javascript(f"navigator.clipboard.writeText({_js_str(md)})")
+		# Also drop it to disk for easy follow-up so the user has a copy
+		# even if the clipboard write fails in their browser.
+		fname = TMP_DIR / f"findings-{time.strftime('%Y%m%d-%H%M%S')}.md"
+		try:
+			fname.write_text(md, encoding="utf-8")
+			ui.notify(f"Findings copied to clipboard + saved to {fname}",
+				type="positive")
+		except OSError as e:
+			ui.notify(f"Copied (disk write failed: {e})", type="warning")
+
 	# ---- Payloads listing ----
 	def refresh_payloads(force: bool = False) -> None:
 		"""Rebuild the payloads card.
@@ -1111,6 +1662,7 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 	ui.timer(2.0, _maybe_refresh_payloads)
 
 	refresh_payloads(force=True)
+	rerender_findings()
 
 
 def resolve_request_files_dry(cfg: RunConfig) -> tuple[Optional[str], Optional[str]]:

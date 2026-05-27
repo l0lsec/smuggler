@@ -4,9 +4,9 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Smuggler - HTTP Request Smuggling / Desync scanner</title>
-<meta name="description" content="Smuggler is an HTTP Request Smuggling / Desync testing tool written in Python 3. Classic TE.CL / CL.TE detection, advanced scanners (CL.0, TE.0, pause, parser-discrepancy, header-removal, expect, hop-by-hop, HTTP/2 downgrade), replay mode with baseline diff, and a NiceGUI web frontend." />
+<meta name="description" content="Smuggler is an HTTP Request Smuggling / Desync testing tool written in Python 3. Classic TE.CL / CL.TE detection, 11 advanced scanners (CL.0, TE.0, pause, parser-discrepancy, header-removal, expect, hop-by-hop, HTTP/2 downgrade), replay mode with baseline diff, a NiceGUI web frontend with a structured findings panel, per-payload viewer / replay / byte-exact repro, and Markdown-ready triage reports." />
 <meta property="og:title" content="Smuggler - HTTP Request Smuggling scanner" />
-<meta property="og:description" content="Classic and advanced HTTP desync detection in pure Python 3, with an optional web GUI." />
+<meta property="og:description" content="Classic and advanced HTTP desync detection in pure Python 3. Optional web GUI with a structured findings panel (confirmed vs needs-manual-confirm), per-payload triage tools, and Markdown report export." />
 <meta property="og:type" content="website" />
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><text y='20' font-size='22'>🐛</text></svg>" />
 <style>
@@ -192,8 +192,13 @@
 	}
 
 	/* ----- Feature grid ----- */
-	.features { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
-	@media (max-width: 800px) { .features { grid-template-columns: 1fr; } }
+	.features {
+		display: grid; gap: 16px;
+		grid-template-columns: repeat(4, 1fr);
+	}
+	@media (max-width: 1100px) { .features { grid-template-columns: repeat(3, 1fr); } }
+	@media (max-width: 900px) { .features { grid-template-columns: repeat(2, 1fr); } }
+	@media (max-width: 600px) { .features { grid-template-columns: 1fr; } }
 	.feature {
 		background: var(--bg-card); border: 1px solid var(--border);
 		border-radius: 12px; padding: 22px;
@@ -312,6 +317,107 @@
 	.conf.med { color: #fdba74; background: rgba(249,115,22,0.1); }
 	.conf.med::before { background: #fb923c; }
 
+	/* ----- Findings panel mockup (#triage section) ----- */
+	.findings-mock {
+		background: var(--bg-card); border: 1px solid var(--border);
+		border-radius: 12px; padding: 18px 20px;
+		box-shadow: 0 20px 60px rgba(0,0,0,0.4), 0 0 0 1px rgba(255,255,255,0.02);
+	}
+	.findings-mock .head {
+		display: flex; justify-content: space-between; align-items: center;
+		gap: 12px; margin-bottom: 14px; flex-wrap: wrap;
+	}
+	.findings-mock .head .title { font-weight: 700; font-size: 15px; }
+	.findings-mock .head .summary {
+		font-size: 12px; color: var(--text-dim); font-family: var(--mono);
+	}
+	.findings-mock .mock-btn {
+		font-size: 11px; padding: 5px 11px; border-radius: 5px;
+		background: rgba(255,255,255,0.04); border: 1px solid var(--border);
+		color: var(--text-dim); font-family: var(--mono);
+		display: inline-flex; align-items: center; gap: 6px;
+	}
+	.findings-mock .section-label {
+		display: flex; align-items: center; gap: 8px;
+		font-size: 13px; font-weight: 600;
+		margin: 14px 0 8px;
+	}
+	.findings-mock .section-label.confirmed { color: #fca5a5; }
+	.findings-mock .section-label.potential { color: #fde68a; }
+	.findings-mock .finding {
+		background: rgba(255,255,255,0.02);
+		border: 1px solid var(--border);
+		border-left: 3px solid var(--red);
+		border-radius: 6px; padding: 12px 14px; margin-bottom: 8px;
+	}
+	.findings-mock .finding.potential { border-left-color: var(--yellow); }
+	.findings-mock .finding .ftitle {
+		font-size: 13px; font-weight: 600; margin-bottom: 4px;
+		display: flex; align-items: center; gap: 8px;
+	}
+	.findings-mock .finding .ftitle .scan {
+		font-family: var(--mono); color: var(--cyan-bright);
+	}
+	.findings-mock .finding .fmeta {
+		display: flex; gap: 14px; font-size: 11px; color: var(--text-muted);
+		margin-bottom: 8px; font-family: var(--mono); flex-wrap: wrap;
+	}
+	.findings-mock .finding .fdesc {
+		font-family: var(--mono); font-size: 11px;
+		color: var(--text-dim); margin-bottom: 10px;
+		word-break: break-all; padding: 6px 8px;
+		background: rgba(0,0,0,0.25); border-radius: 4px;
+	}
+	.findings-mock .payload-row {
+		display: flex; align-items: center; gap: 8px;
+		background: rgba(6, 182, 212, 0.05);
+		border: 1px solid rgba(6, 182, 212, 0.15);
+		border-radius: 5px; padding: 7px 10px; margin: 8px 0;
+		font-size: 12px; flex-wrap: wrap;
+	}
+	.findings-mock .payload-row .pname {
+		flex: 1; min-width: 0;
+		font-family: var(--mono); font-size: 11px; color: var(--cyan-bright);
+		white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+	}
+	.findings-mock .payload-row .action {
+		font-size: 11px; color: var(--text-dim);
+		border: 1px solid var(--border); padding: 3px 9px;
+		border-radius: 4px; background: rgba(255,255,255,0.02);
+		font-family: var(--mono);
+	}
+	.findings-mock .steps-label {
+		font-size: 11px; font-weight: 700; color: var(--text-dim);
+		text-transform: uppercase; letter-spacing: 0.06em;
+		margin: 12px 0 6px;
+	}
+	.findings-mock ol.steps {
+		margin: 0 0 4px; padding-left: 20px; font-size: 12px;
+		line-height: 1.6; color: var(--text-dim);
+	}
+	.findings-mock ol.steps li { margin-bottom: 4px; }
+	.findings-mock ol.steps code {
+		font-size: 11px; padding: 1px 4px;
+	}
+	.findings-mock .pre-step {
+		background: #050810; border: 1px solid var(--border);
+		border-radius: 4px; padding: 6px 8px; margin: 4px 0 6px;
+		font-family: var(--mono); font-size: 11px; line-height: 1.5;
+		color: var(--text-dim); overflow-x: auto;
+	}
+	.findings-mock .finding-actions {
+		display: flex; justify-content: flex-end; margin-top: 8px;
+	}
+	.triage-split {
+		display: grid; grid-template-columns: 1fr 1fr; gap: 32px;
+		align-items: start;
+	}
+	@media (max-width: 900px) { .triage-split { grid-template-columns: 1fr; } }
+	.triage-split ul.checks { list-style: none; padding: 0; margin: 0; }
+	.triage-split ul.checks li { padding: 8px 0; display: flex; gap: 10px; color: var(--text-dim); }
+	.triage-split ul.checks li::before { content: "→"; color: var(--cyan-bright); flex-shrink: 0; }
+	.triage-split ul.checks li strong { color: var(--text); font-weight: 600; }
+
 	/* ----- Code blocks with copy ----- */
 	.code-block {
 		position: relative; margin: 0;
@@ -385,8 +491,9 @@
 	<div class="nav-links">
 		<a href="#features">Features</a>
 		<a href="#install">Install</a>
-		<a href="#scans">Detection matrix</a>
 		<a href="#gui">Web GUI</a>
+		<a href="#triage">Triage</a>
+		<a href="#scans">Detection matrix</a>
 		<a href="https://github.com/l0lsec/smuggler">GitHub</a>
 	</div>
 </nav>
@@ -394,14 +501,17 @@
 <main>
 
 <section class="hero container">
-	<span class="pill"><span class="dot"></span>v2.0 - now with web GUI + 11 advanced scanners</span>
+	<span class="pill"><span class="dot"></span>v2.0 - web GUI, findings triage, per-payload tools, 11 scanners</span>
 	<h1>HTTP Request Smuggling,<br/>made approachable.</h1>
 	<p class="lead">
 		An HTTP desync / request-smuggling testing tool in pure Python 3.
 		Classic TE.CL and CL.TE detection backed by a timing oracle and a positive
 		gadget probe, plus a stack of advanced scanners (CL.0, TE.0, pause-based,
 		parser discrepancy, header removal, Expect, hop-by-hop, bare-LF chunked,
-		connection-state, HTTP/2 downgrade) - and now an optional web GUI.
+		connection-state, HTTP/2 downgrade) - all wrapped in an optional web GUI
+		with a structured findings panel that splits confirmed findings from the
+		ones you still need to validate, and turns the whole run into a
+		triage-ready Markdown report.
 	</p>
 	<div class="cta">
 		<a class="btn primary" href="#install">Get started →</a>
@@ -461,7 +571,17 @@
 		<div class="feature">
 			<div class="icon">🎨</div>
 			<h3>Web GUI</h3>
-			<p>Optional NiceGUI frontend exposes every CLI flag, streams colorized output to your browser, renders live replay stats, and lists generated payload files for download.</p>
+			<p>Optional NiceGUI frontend exposes every CLI flag, streams colorized output to your browser, and renders live replay stats with a graceful SIGINT&nbsp;→&nbsp;SIGKILL stop ladder.</p>
+		</div>
+		<div class="feature">
+			<div class="icon">🩺</div>
+			<h3>Findings triage</h3>
+			<p>Real-time panel splits results into <strong>Confirmed</strong> (oracle fired) and <strong>Needs manual confirmation</strong> (single-signal heuristic). Each finding ships with a per-class confirmation / escalation playbook and a one-click <strong>Copy as Markdown</strong> report.</p>
+		</div>
+		<div class="feature">
+			<div class="icon">🔬</div>
+			<h3>Per-payload tools</h3>
+			<p>Inline hex + annotated-text viewer (the invisible <code>0x09</code>/<code>0x0a</code> byte that makes the mutation work is highlighted), one-click <strong>Replay this</strong>, and copy a byte-exact <code>openssl&nbsp;s_client</code> / <code>ncat</code> reproduction command - no <code>-crlf</code>, so bare-LF mutations survive.</p>
 		</div>
 		<div class="feature">
 			<div class="icon">🛠️</div>
@@ -546,11 +666,15 @@ python3 webgui.py">copy</button></pre>
 			<ul class="checks">
 				<li>Three target modes: <strong>single URL</strong>, <strong>list of hosts</strong> (piped via stdin), or <strong>request file</strong> (upload, path, or inline edit).</li>
 				<li>Full CLI parity - <strong>every flag</strong> from <code>--scan-type</code> down to <code>--pause-timeout</code> is a form control.</li>
+				<li><strong>Structured Findings panel</strong> parses smuggler's stdout in real time and splits results into <em>Confirmed</em> vs <em>Needs manual confirmation</em>.</li>
+				<li>Each finding ships with a <strong>per-class confirmation / escalation playbook</strong> tailored to the scan that fired (CLTE, CL.0, ParserDisc, HopByHop, …).</li>
+				<li><strong>Markdown report export</strong> — copy the whole triage report (or a single finding) ready to paste into a bounty / pentest ticket.</li>
+				<li>Per-payload actions: <strong>hex + annotated text viewer</strong> (highlights the invisible <code>0x09</code> / <code>0x0a</code> byte that makes the mutation work), <strong>one-click Replay</strong>, and <strong>byte-exact <code>openssl s_client</code> repro</strong>.</li>
+				<li>Live payload discovery — new files dropped into <code>payloads/</code> mid-run get a <strong>NEW badge</strong> and a toast notification.</li>
 				<li><strong>Replay live stats</strong>: total / success / failed / timeout / error / RPS / baseline-ratio / latest request ID.</li>
-				<li><strong>Colorized output</strong>: smuggler's ANSI codes are rendered as styled HTML.</li>
+				<li><strong>Colorized output</strong> with smuggler's ANSI rendered as styled HTML.</li>
 				<li>Stop button sends <strong>SIGINT → SIGTERM → SIGKILL</strong> in a graceful ladder.</li>
 				<li>"<strong>Copy command</strong>" surfaces the exact <code>python3 smuggler.py …</code> invocation.</li>
-				<li>Built-in <strong>payloads browser</strong> with download links for any files produced by a CRITICAL finding.</li>
 			</ul>
 		</div>
 	</div>
