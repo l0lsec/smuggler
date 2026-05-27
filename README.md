@@ -7,27 +7,50 @@
 (______/|_|_|_|____/ \___ |\___ |\_)_____)_|    
                     (_____(_____|               
 
-     @defparam
+     @l0lsec
 ```
 
 # Smuggler
 
-An HTTP Request Smuggling / Desync testing tool written in Python 3
+An HTTP Request Smuggling / Desync testing tool written in Python 3.
 
-**Version 1.1** - Now includes replay mode, proxy support, custom request files, persistent connections, and enhanced cookie handling.
+> **This is my fork.** Inspired by — and originally based on — the OG
+> [@defparam/smuggler](https://github.com/defparam/smuggler). Active
+> development now lives at
+> [l0lsec/smuggler](https://github.com/l0lsec/smuggler); the upstream
+> repository has not been updated in a while, so this fork is where new
+> scanners, the web GUI, the test harness, and bug fixes are landing.
+
+**Version 2.0** — adds 9 advanced scanner classes (CL.0, TE.0, bare-LF
+chunked, pause-based, parser-discrepancy, header-removal, Expect,
+hop-by-hop, connection-state, HTTP/2 downgrade), a confirmation-first
+oracle for the classic TE.CL / CL.TE scanners, a NiceGUI web frontend
+(`webgui.py`), a pytest harness with a mock HRS server, and a long list
+of correctness fixes around persistent connections, replay-mode CL
+recomputation, and request-file validation.
+
+**Version 1.1** (upstream) — replay mode, proxy support, custom request
+files, persistent connections, enhanced cookie handling.
 
 ## Acknowledgements
 
-A special thanks to [James Kettle](https://skeletonscribe.net/) for his [research and methods into HTTP desyncs](https://portswigger.net/research/http-desync-attacks-request-smuggling-reborn)
+A huge thank-you to [Evan Custodio / @defparam](https://github.com/defparam)
+for building the original Smuggler — this fork would not exist without
+his work. The MIT license carries through unchanged.
 
-And a special thanks to [Ben Sadeghipour](https://www.nahamsec.com/) for beta testing Smuggler and for allowing me to discuss my work at [Nahamcon 2020](https://nahamcon.com)
+A special thanks to [James Kettle](https://skeletonscribe.net/) for his
+[research and methods into HTTP desyncs](https://portswigger.net/research/http-desync-attacks-request-smuggling-reborn),
+which the scanners in this fork build on.
+
+And a special thanks to [Ben Sadeghipour](https://www.nahamsec.com/) for
+beta testing the original Smuggler at [Nahamcon 2020](https://nahamcon.com).
 
 ## IMPORTANT
 This tool does not guarantee no false-positives or false-negatives. Just because a mutation may report OK does not mean there isn't a desync issue, but more importantly just because the tool indicates a potential desync issue does not mean there definitely exists one. The script may encounter request processors from large entities (i.e. Google/AWS/Yahoo/Akamai/etc..) that may show false positive results.
 
 ## Installation
 
-1) git clone https://github.com/defparam/smuggler.git
+1) git clone https://github.com/l0lsec/smuggler.git
 2) cd smuggler
 3) python3 smuggler.py -h
 
@@ -329,4 +352,5 @@ After you find a desync issue feel free to use my Turbo Intruder desync scripts 
 `DesyncAttack_CLTE.py` and `DesyncAttack_TECL.py` are great scripts to help stage a desync attack
 
 ## License
-These scripts are released under the MIT license. See [LICENSE](https://github.com/defparam/smuggler/blob/master/LICENSE).
+These scripts are released under the MIT license. See [LICENSE](https://github.com/l0lsec/smuggler/blob/master/LICENSE).
+The original copyright (c) 2020 Evan Custodio is preserved.

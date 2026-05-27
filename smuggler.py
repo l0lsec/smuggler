@@ -1116,6 +1116,13 @@ def process_uri(uri):
 		exit(1)
 
 	path = u.path or "/"
+	# Preserve query string + fragment so endpoints like
+	# `/foo?action=bar&id=1` aren't silently truncated to `/foo` before
+	# being fed to the smuggling payloads.
+	if u.query:
+		path += "?" + u.query
+	if u.fragment:
+		path += "#" + u.fragment
 	if u.port:
 		return (u.hostname, u.port, path, ssl_flag)
 	else:
@@ -1142,7 +1149,7 @@ def banner(sm_version):
 	print(CF(r"(______/|_|_|_|____/ \___ |\___ |\_)_____)_|    "))
 	print(CF(r"                    (_____(_____|               "))
 	print(CF(r""))
-	print(CF(r"     @defparam                         %s"%(sm_version)))
+	print(CF(r"     @l0lsec                           %s"%(sm_version)))
 	print(CF(Style.RESET_ALL))
 
 def print_info(msg, file_handle=None):

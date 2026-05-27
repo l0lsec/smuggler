@@ -431,7 +431,7 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 				ui.label("Smuggler").classes("text-2xl font-bold")
 				ui.label("HTTP Request Smuggling / Desync scanner - web GUI") \
 					.classes("text-xs text-gray-500")
-		ui.link("github / @defparam", "https://github.com/defparam/smuggler", new_tab=True) \
+		ui.link("github / @l0lsec", "https://github.com/l0lsec/smuggler", new_tab=True) \
 			.classes("text-xs text-gray-400")
 
 	ui.separator()
@@ -445,9 +445,12 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 			with ui.card().classes("w-full"):
 				ui.label("Target").classes("text-base font-semibold")
 				with ui.tabs().classes("w-full") as target_tabs:
-					t_url = ui.tab("Single URL")
-					t_list = ui.tab("List of hosts")
-					t_req = ui.tab("Request file")
+					# Tab `name` is the slug we use as cfg.mode; `label` is the
+					# user-facing text. Keeping them in sync removes the
+					# string-matching dance from the change handler.
+					t_url = ui.tab("url", label="Single URL")
+					t_list = ui.tab("list", label="List of hosts")
+					t_req = ui.tab("request", label="Request file")
 				with ui.tab_panels(target_tabs, value=t_url).classes("w-full") as target_panels:
 					with ui.tab_panel(t_url):
 						url_in = ui.input("URL", placeholder="https://target.com/path") \
@@ -504,15 +507,17 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 						_toggle_req_panels()
 
 				def _on_target_tab(e):
+					# NiceGUI 3.x passes the tab `name` as a plain string;
+					# 2.x passed the Tab element itself. Handle both so the
+					# inline-request workflow doesn't silently stay in 'url'
+					# mode and drop the user's pasted request.
 					val = e.value if hasattr(e, "value") else target_tabs.value
-					# Map tab object name to mode
-					name = getattr(val, "_props", {}).get("name") if val else None
-					if name == "Single URL":
-						cfg.mode = "url"
-					elif name == "List of hosts":
-						cfg.mode = "list"
-					elif name == "Request file":
-						cfg.mode = "request"
+					if hasattr(val, "_props"):
+						name = val._props.get("name")
+					else:
+						name = val if isinstance(val, str) else None
+					if name in {"url", "list", "request"}:
+						cfg.mode = name
 				target_tabs.on_value_change(_on_target_tab)
 
 			# --- Mode / toggles -----
@@ -848,5 +853,7 @@ if __name__ in {"__main__", "__mp_main__"}:
 		print("[smuggler-gui] WARNING: bound on 0.0.0.0 - this is unsafe for an "
 			"offensive tool. Anyone who reaches this port can launch scans.",
 			file=sys.stderr)
+	# favicon: NiceGUI accepts a file path or an emoji (NOT a Quasar icon
+	# name -- those only work on in-page ui.icon() calls).
 	ui.run(host=bind, port=args.port, title="Smuggler GUI",
-		reload=False, show=False, favicon="bug_report")
+		reload=False, show=False, favicon="🐛")
