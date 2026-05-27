@@ -139,7 +139,7 @@ class RunConfig:
 	method: str = "POST"
 	timeout: float = 5.0
 	configfile: str = "default.py"
-	proxy: str = ""
+	proxy: str = "http://127.0.0.1:8080"
 	cookies: str = ""
 	log_file: str = ""
 	scan_types: list = field(default_factory=lambda: ["tecl", "clte"])
