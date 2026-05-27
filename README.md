@@ -266,16 +266,16 @@ its oracle type, and the confidence you can place in a positive finding.
 
 | Attack class | Scanner (`--scan-type`) | Oracle | Confidence |
 | --- | --- | --- | --- |
-| TE.CL / CL.TE | `tecl`, `clte` (default) | Timing anomaly + positive gadget-smuggle probe (uses the dynamic `GadgetOracle` -- see below) | High when both signals fire; medium on timing alone |
-| CL.0 / 0.CL | `cl0` | Pipelined victim request observes the smuggled gadget; tries the user's method + GET + POST | High (3-of-5 confirmations required) |
-| TE.0 | `te0` | Pipelined victim request observes the smuggled gadget after a zero-chunk terminator | High (3-of-5) |
-| Bare-LF / Bare-CR chunked | `bare-lf` | Pipelined victim observes the smuggled prefix when chunk framing uses bare LF/CR | High (3-of-5) |
-| Pause-based desync | `pause` | Send headers, pause N s, send body; pipelined victim observes smuggled prefix | Medium-high (2-of-3); pause length tunable with `--pause-timeout` |
-| Connection-state attack | `connection-state` | Pipelined `bad-Host` request returns a different status than a same request on a fresh connection | Medium; confirmed via second pipeline |
-| Parser discrepancy | `parser-discrepancy` | Per-technique control + canary probe; only flags when the technique alone matches baseline but the canary diverges | Medium-high (now resistant to malformed-technique false positives) |
-| Header removal (Keep-Alive) | `header-removal` | Matched-pair comparison of harmless vs attack request; requires 3 of 5 reproducible divergences | Medium-high |
-| Expect-based desync | `expect` | Multiple Expect variants pipelined with a victim; same gadget oracle as CL.0 | High when confirmed |
-| Hop-by-hop auth bypass | `hop-by-hop` | Baseline vs `Connection: <header>` probe; status flip confirmed 2-of-3 | High when reproducible |
+| TE.CL / CL.TE | `tecl`, `clte` (default) | Timing anomaly + dynamic gadget-smuggle probe + victim-leg fingerprint diff + statistical RTT baseline (see "Dynamic gadget oracle" and "Differential signals" below) | Tiered: `STRONG` (timing + 2+ corroborators), `CONFIRMED` (timing + 1), `Potential` (timing only) |
+| CL.0 / 0.CL | `cl0` | Pipelined victim observes the smuggled gadget AND/OR victim-leg fingerprint diverges from a clean baseline; tries the user's method + GET + POST | High (3-of-5 confirmations required) |
+| TE.0 | `te0` | Pipelined victim observes the smuggled gadget AND/OR victim-leg fingerprint diverges after a zero-chunk terminator | High (3-of-5) |
+| Bare-LF / Bare-CR chunked | `bare-lf` | Pipelined victim observes the smuggled gadget AND/OR victim-leg fingerprint diverges when chunk framing uses bare LF/CR | High (3-of-5) |
+| Pause-based desync | `pause` | Send headers, pause N s, send body; pipelined victim observes smuggled gadget AND/OR victim-leg fingerprint diverges | Medium-high (2-of-3); pause length tunable with `--pause-timeout` |
+| Connection-state attack | `connection-state` | Pipelined `bad-Host` returns different status from same request on a fresh connection (`CONNSTATE`) OR returns structurally different response on >=2 fingerprint axes (`CONNSTATE_FP`) | Medium; confirmed via second pipeline |
+| Parser discrepancy | `parser-discrepancy` | Per-technique control + canary probe with status-axis oracle; fingerprint axes annotated on every finding, `HIDDEN` downgrades to `PARTIAL-HIDE` when non-status axes also flip | Medium-high |
+| Header removal (Keep-Alive) | `header-removal` | Matched-pair comparison; flags on status / canary-presence flips (`HDRREMOVAL`) OR on >=3/5 reproducible fingerprint-only divergences (`HDRREMOVAL_FP`) | Medium-high |
+| Expect-based desync | `expect` | Multiple Expect variants pipelined with a victim; same gadget + fingerprint oracle as CL.0 | High when confirmed |
+| Hop-by-hop auth bypass | `hop-by-hop` | Baseline vs `Connection: <header>` probe; flags on status flip (`HOPBYHOP_*`) OR on reproducible non-status fingerprint divergence (`HOPBYHOP_FP_*`) | High when reproducible |
 | HTTP/2 downgrade | `h2` (or `--http2`) | Sends the H2 attack stream, then opens a parallel H1 connection and checks whether the victim received the gadget response | High (was previously low/wrong - see "HTTP/2 oracle" below) |
 
 ### Dynamic gadget oracle
@@ -324,6 +324,113 @@ When no candidate is viable (target completely unreachable, all probes
 returning 5xx) the scanners transparently fall back to the legacy pair
 so behavior never regresses below the prior baseline.
 
+### Differential signals
+
+On top of the gadget oracle, every scanner now consults two
+diff-based corroborating signals: a structural **response fingerprint**
+(`lib/Fingerprint.py`) and a **statistical RTT baseline**
+(`lib/Timing.py`). Both are sampled once per target and shared across
+every probe.
+
+#### Fingerprint axes
+
+`Fingerprint.from_response` extracts six orthogonal axes from each
+response:
+
+| Axis | What it captures |
+| --- | --- |
+| `status` | 3-digit status code |
+| `framing` | `cl:<n>` / `chunked` / `none` |
+| `header_set` | order-independent set of lowercased header names |
+| `body_len` | length of the body bytes |
+| `body_head` | md5 of the first 64 body bytes |
+| `body_tail` | md5 of the last 64 body bytes |
+
+A clean baseline is taken N=3 times on fresh connections; any axis
+that disagreed across the three samples is recorded as **noisy** (the
+target itself flips it -- think `Date:`, `X-Request-Id:`, dynamic
+cache tags) and excluded from subsequent diff comparisons. A probe
+response is treated as **structurally different** from baseline when
+its diff hits the `status` axis OR >=2 non-noisy axes. The
+multi-axis threshold rejects single-axis blips that slipped past the
+baseline sampler.
+
+This catches a large class of desyncs that the previous status-only
+oracle silently missed:
+
+- **Hop-by-hop strip without status change** -- backend serves 200 in
+  both legs but a `Set-Cookie` appears / disappears when the
+  intermediary strips `Authorization`. New `HOPBYHOP_FP_*` payload.
+- **Header removal with canary echoed** -- 200 in both legs, canary
+  present in both bodies, but the attack response gains an `X-Edge`
+  header and a longer body. New `HDRREMOVAL_FP` payload.
+- **Connection state without status diff** -- pipelined response
+  matches direct status but structurally differs on multiple axes.
+  New `CONNSTATE_FP` payload.
+- **Pipeline-gadget desyncs that swallow the gadget body** -- the
+  victim leg comes back empty / truncated / status-flipped even when
+  no gadget signature appears. All five pipeline-gadget scanners
+  (`cl0`, `te0`, `bare-lf`, `expect`, `pause`) now count this as a
+  confirmation.
+
+#### Statistical RTT baseline
+
+`TimingBaseline.sample` records RTTs of N=5 benign victim requests on
+fresh connections and stores median + median-absolute-deviation
+(MAD). The classic CLTE/TECL flow then asks `is_anomalous(rtt, k=3)`
+which fires when `|rtt - median| > k * MAD`. MAD is preferred over
+stddev because it is robust to the very outliers we're trying to
+detect; a 50ms MAD floor prevents the predicate from classifying
+trivial localhost wobble as anomalous.
+
+This is wired in **augment** mode: the existing binary timeout oracle
+(`self._timeout - 1` deadline) is unchanged, and the statistical
+result is consumed only as one of three corroborators that combine
+into a confidence tier:
+
+| Tier | Required signals |
+| --- | --- |
+| `STRONG` | Reproducible timeout + 2 or 3 of {gadget hit, victim fingerprint divergence, RTT anomaly} |
+| `CONFIRMED` | Reproducible timeout + exactly 1 corroborator |
+| `Potential` | Reproducible timeout, no corroborator |
+
+Every classic finding now prints which corroborators fired:
+
+```
+[postspace-09]: STRONG CLTE Issue Found - POST @ https://target/api - default.py [gadget,fp=status+body_len,rtt]
+```
+
+The annotation (`[gadget,fp=status+body_len,rtt]`) makes it trivial to
+tell whether you're looking at a high-confidence finding or a
+timing-only blip on a noisy CDN.
+
+#### Worked example: Akamai edge with `Disallow:` stripped
+
+The original scanner used `/robots.txt` + the substring `"llow:"` as
+the only positive smuggling oracle. On an Akamai-fronted target that
+strips the `Disallow:` line from `/robots.txt` responses, that
+oracle silently returns `False` -- the finding gets tagged as
+`Potential` (timing-only) and gets buried in the noise of a busy
+scan.
+
+Under the new pipeline:
+
+1. `GadgetOracle` walks the candidate catalogue and picks
+   `OPTIONS /` (returns `Allow: GET, POST, HEAD, OPTIONS` on most
+   Akamai stacks; baseline returned `405`). Auto-derived look_for
+   becomes `"Allow:"`, matched header-only.
+2. The CLTE timing oracle fires reproducibly.
+3. `_smuggle_gadget_probe_full` runs: the smuggled `OPTIONS /` hits
+   the backend, the victim leg comes back with a fingerprint
+   diverging on `status` (200 vs baseline 200, but `Content-Length`
+   flipped from 4287 -> 0 and `Last-Modified` disappeared from
+   `header_set`).
+4. `TimingBaseline.is_anomalous(rtt, k=3)` flags the response RTT as
+   well outside the per-target median + MAD.
+
+Result: `STRONG CLTE Issue Found ... [gadget,fp=header_set+body_len,rtt]`.
+The old detector would have called this `Potential` at best.
+
 ### HTTP/2 oracle
 
 Earlier versions inspected the H2 response stream itself for gadget tokens
@@ -353,10 +460,15 @@ python -m pytest tests/ -v
 ```
 
 `tests/mock_server.py` provides a pluggable HTTP/1.1 server that
-simulates each HRS class; `tests/test_scans.py` runs positive + negative
-cases against every advanced scanner; `tests/test_recv_multiple.py` and
-`tests/test_replay_rewrite.py` are regression coverage for the response
-splitter and the replay-mode request rewriter.
+simulates each HRS class; `tests/test_scans.py` runs positive +
+negative cases against every advanced scanner (including the new
+fingerprint-only detection paths `hopbyhop_fp_only` and
+`header_removal_fp`); `tests/test_oracle.py` covers the dynamic
+`GadgetOracle`; `tests/test_fingerprint.py` and `tests/test_timing.py`
+cover the structural / statistical primitives;
+`tests/test_recv_multiple.py` and `tests/test_replay_rewrite.py` are
+regression coverage for the response splitter and the replay-mode
+request rewriter.
 
 ## Helper Scripts
 After you find a desync issue feel free to use my Turbo Intruder desync scripts found Here: https://github.com/defparam/tiscripts

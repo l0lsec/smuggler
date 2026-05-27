@@ -4,9 +4,9 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Smuggler - HTTP Request Smuggling / Desync scanner</title>
-<meta name="description" content="Smuggler is an HTTP Request Smuggling / Desync testing tool written in Python 3. Classic TE.CL / CL.TE detection, 11 advanced scanners (CL.0, TE.0, pause, parser-discrepancy, header-removal, expect, hop-by-hop, HTTP/2 downgrade), replay mode with baseline diff, a NiceGUI web frontend with a structured findings panel, per-payload viewer / replay / byte-exact repro, and Markdown-ready triage reports." />
+<meta name="description" content="Smuggler is an HTTP Request Smuggling / Desync testing tool written in Python 3. Classic TE.CL / CL.TE detection corroborated by dynamic gadget oracle + structural response fingerprinting + statistical RTT baseline (tiered STRONG / CONFIRMED / Potential confidence), 11 advanced scanners (CL.0, TE.0, pause, parser-discrepancy, header-removal, expect, hop-by-hop, HTTP/2 downgrade), replay mode with baseline diff, a NiceGUI web frontend with a structured findings panel, per-payload viewer / replay / byte-exact repro, and Markdown-ready triage reports." />
 <meta property="og:title" content="Smuggler - HTTP Request Smuggling scanner" />
-<meta property="og:description" content="Classic and advanced HTTP desync detection in pure Python 3. Optional web GUI with a structured findings panel (confirmed vs needs-manual-confirm), per-payload triage tools, and Markdown report export." />
+<meta property="og:description" content="Classic and advanced HTTP desync detection in pure Python 3. Dynamic per-target gadget oracle, response fingerprinting, statistical RTT baseline, tiered confidence. Optional web GUI with structured findings, per-payload triage tools, Markdown export." />
 <meta property="og:type" content="website" />
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><text y='20' font-size='22'>🐛</text></svg>" />
 <style>
@@ -310,12 +310,79 @@
 	.conf::before {
 		content: ""; width: 6px; height: 6px; border-radius: 50%;
 	}
+	.conf.strong { color: #fca5a5; background: rgba(239,68,68,0.1); }
+	.conf.strong::before { background: var(--red); }
 	.conf.high { color: #86efac; background: rgba(34,197,94,0.1); }
 	.conf.high::before { background: var(--green); }
 	.conf.medhigh { color: #fde68a; background: rgba(234,179,8,0.1); }
 	.conf.medhigh::before { background: var(--yellow); }
 	.conf.med { color: #fdba74; background: rgba(249,115,22,0.1); }
 	.conf.med::before { background: #fb923c; }
+	.conf.tiered { color: #c4b5fd; background: rgba(139,92,246,0.1); }
+	.conf.tiered::before { background: #a78bfa; }
+
+	/* ----- Signals / oracle visualization ----- */
+	.signals-grid {
+		display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px;
+		margin: 24px 0;
+	}
+	@media (max-width: 800px) { .signals-grid { grid-template-columns: 1fr; } }
+	.signal-card {
+		background: var(--bg-card); border: 1px solid var(--border);
+		border-radius: 12px; padding: 20px;
+		border-top: 3px solid var(--cyan);
+	}
+	.signal-card.gadget { border-top-color: var(--magenta); }
+	.signal-card.fp { border-top-color: var(--cyan); }
+	.signal-card.rtt { border-top-color: var(--yellow); }
+	.signal-card h4 {
+		font-size: 14px; font-weight: 700; margin: 0 0 8px;
+		font-family: var(--mono); letter-spacing: 0.02em;
+	}
+	.signal-card h4 .src {
+		color: var(--text-muted); font-weight: 400; font-size: 11px;
+		margin-left: 6px;
+	}
+	.signal-card p {
+		font-size: 13px; color: var(--text-dim); margin: 0;
+		line-height: 1.55;
+	}
+	.tier-table {
+		width: 100%; border-collapse: collapse;
+		background: var(--bg-card); border: 1px solid var(--border);
+		border-radius: 12px; overflow: hidden;
+		font-size: 14px; margin: 16px 0;
+	}
+	.tier-table th, .tier-table td {
+		text-align: left; padding: 12px 16px;
+		border-bottom: 1px solid var(--border);
+	}
+	.tier-table tr:last-child td { border-bottom: 0; }
+	.tier-table th {
+		font-weight: 600; color: var(--text-dim);
+		background: rgba(255,255,255,0.02);
+		font-size: 12px; text-transform: uppercase;
+		letter-spacing: 0.05em;
+	}
+	.fp-axes {
+		display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0 0;
+	}
+	.fp-axes code {
+		background: rgba(6, 182, 212, 0.08);
+		color: var(--cyan-bright);
+		padding: 3px 8px; border-radius: 4px; font-size: 11px;
+		border: 1px solid rgba(6, 182, 212, 0.15);
+	}
+	.example-finding {
+		background: #050810; border: 1px solid var(--border);
+		border-radius: 8px; padding: 14px 16px; margin: 16px 0;
+		font-family: var(--mono); font-size: 13px; line-height: 1.6;
+		overflow-x: auto;
+	}
+	.example-finding .lbl-strong { color: var(--red); font-weight: 700; }
+	.example-finding .lbl-scan { color: var(--cyan-bright); }
+	.example-finding .lbl-host { color: var(--text-dim); }
+	.example-finding .lbl-annot { color: var(--magenta); }
 
 	/* ----- Findings panel mockup (#triage section) ----- */
 	.findings-mock {
@@ -492,7 +559,7 @@
 		<a href="#features">Features</a>
 		<a href="#install">Install</a>
 		<a href="#gui">Web GUI</a>
-		<a href="#triage">Triage</a>
+		<a href="#signals">Signals</a>
 		<a href="#scans">Detection matrix</a>
 		<a href="https://github.com/l0lsec/smuggler">GitHub</a>
 	</div>
@@ -501,17 +568,20 @@
 <main>
 
 <section class="hero container">
-	<span class="pill"><span class="dot"></span>v2.0 - Web GUI, findings triage, per-payload tools, 11 scanners</span>
+	<span class="pill"><span class="dot"></span>v2.1 - Dynamic gadget oracle, response fingerprinting, RTT baseline, tiered confidence</span>
 	<h1>HTTP Request Smuggling,<br/>made approachable.</h1>
 	<p class="lead">
 		An HTTP desync / request-smuggling testing tool in pure Python 3.
-		Classic TE.CL and CL.TE detection backed by a timing oracle and a positive
-		gadget probe, plus a stack of advanced scanners (CL.0, TE.0, pause-based,
-		parser discrepancy, header removal, Expect, hop-by-hop, bare-LF chunked,
-		connection-state, HTTP/2 downgrade) - all wrapped in an optional web GUI
-		with a structured findings panel that splits confirmed findings from the
-		ones you still need to validate, and turns the whole run into a
-		triage-ready Markdown report.
+		Classic TE.CL and CL.TE detection corroborated by three independent signals -
+		a <strong>per-target dynamic gadget oracle</strong>, <strong>structural
+		response fingerprinting</strong>, and a <strong>statistical RTT baseline</strong> -
+		that combine into a tiered <code>STRONG</code> / <code>CONFIRMED</code> /
+		<code>Potential</code> confidence label. Same stack of advanced scanners
+		(CL.0, TE.0, pause-based, parser discrepancy, header removal, Expect,
+		hop-by-hop, bare-LF chunked, connection-state, HTTP/2 downgrade), now with
+		fingerprint-only detection paths that catch desyncs the old status-only
+		oracle silently missed. Optional NiceGUI web frontend with a structured
+		findings panel and Markdown report export.
 	</p>
 	<div class="cta">
 		<a class="btn primary" href="#install">Get started →</a>
@@ -530,7 +600,7 @@
  _____) ) | | | |_| ( (_| ( (_| | || ____| |    
 (______/|_|_|_|____/ \___ |\___ |\_)_____)_|    
                     (_____(_____|               
-     @l0lsec                                v2.0</pre>
+     @l0lsec                                v2.1</pre>
 		<div class="prompt-line">
 			<span class="p">$</span> <span class="c">python3 smuggler.py</span> -u https://target.com/ --scan-type all<span class="cursor"></span>
 		</div>
@@ -565,8 +635,18 @@
 		</div>
 		<div class="feature">
 			<div class="icon">🧪</div>
-			<h3>Confirmation-first</h3>
-			<p>Timing anomalies are confirmed across multiple attempts and corroborated with positive gadget probes (e.g. surfacing a smuggled <code>/robots.txt</code> on a victim request) before being reported.</p>
+			<h3>Tiered confidence</h3>
+			<p>Findings vote across timing + gadget + fingerprint + RTT-baseline signals. <code>STRONG</code> (timing + 2-3 corroborators), <code>CONFIRMED</code> (timing + 1), <code>Potential</code> (timing only). No more guessing whether a timing blip is real.</p>
+		</div>
+		<div class="feature">
+			<div class="icon">🎯</div>
+			<h3>Dynamic gadget oracle</h3>
+			<p>Per-target gadget selection (OPTIONS *, random 404, robots, favicon, query reflection) with <strong>auto-derived</strong> <code>look_for</code> signatures and a per-run canary. Replaces the hard-coded <code>/robots.txt</code> + <code>"llow:"</code> pair that silently broke on Akamai / Cloudflare edges.</p>
+		</div>
+		<div class="feature">
+			<div class="icon">🔍</div>
+			<h3>Fingerprint diff</h3>
+			<p>Six-axis structural diff (status, framing, headers, body length, body head/tail hashes) with a 3-sample noisy-axis baseline. Catches desyncs that flip <code>Set-Cookie</code> or <code>Content-Length</code> without changing status - <code>HOPBYHOP_FP_*</code>, <code>HDRREMOVAL_FP</code>, <code>CONNSTATE_FP</code> payload tags.</p>
 		</div>
 		<div class="feature">
 			<div class="icon">🎨</div>
@@ -686,12 +766,88 @@ python3 webgui.py">copy</button></pre>
 	</div>
 </section>
 
+<section id="signals" class="container">
+	<span class="label">New in v2.1</span>
+	<h2>Three signals, one tiered verdict.</h2>
+	<p class="sub">
+		Every scanner now consults three independent oracle signals on top of the
+		original timing check. Findings combine them into a confidence tier so
+		you know whether you're looking at a high-signal lead or a CDN blip.
+	</p>
+
+	<div class="signals-grid">
+		<div class="signal-card gadget">
+			<h4>Dynamic gadget oracle <span class="src">lib/Oracle.py</span></h4>
+			<p>Per-target candidate probe (OPTIONS *, random-404, robots, favicon, query-reflect) with <strong>auto-derived <code>look_for</code></strong> - canary reflection &gt; status divergence &gt; distinctive header &gt; body n-gram. Replaces the hard-coded <code>/robots.txt</code> + <code>"llow:"</code> pair that silently broke on Akamai, sharded backends, and any target that doesn't serve robots.</p>
+		</div>
+		<div class="signal-card fp">
+			<h4>Response fingerprint <span class="src">lib/Fingerprint.py</span></h4>
+			<p>Six-axis structural snapshot diffed against a 3-sample baseline. The baseline records which axes are noisy on this target (Date, request IDs, cache tags) and excludes them from later diffs. A probe is "structurally different" when it diverges on the <code>status</code> axis OR on &gt;=2 non-noisy axes.</p>
+			<div class="fp-axes">
+				<code>status</code><code>framing</code><code>header_set</code><code>body_len</code><code>body_head</code><code>body_tail</code>
+			</div>
+		</div>
+		<div class="signal-card rtt">
+			<h4>Statistical RTT baseline <span class="src">lib/Timing.py</span></h4>
+			<p>N=5 RTT samples on fresh connections produce <strong>median + MAD</strong>. A response is flagged when <code>|rtt - median| &gt; k * MAD</code> (k=3). MAD is robust to the very outliers we're detecting; a 50ms MAD floor stops localhost-flat baselines from classifying every wobble as anomalous. Augments - does not replace - the binary timeout deadline.</p>
+		</div>
+	</div>
+
+	<h3 style="margin: 32px 0 12px;">Confidence tiers</h3>
+	<p class="sub" style="margin-bottom: 12px;">
+		Reproducible timing anomaly is the entry ticket; the three corroborators
+		decide the tier. Annotation in square brackets shows which fired.
+	</p>
+
+	<table class="tier-table">
+		<thead>
+			<tr>
+				<th>Tier</th>
+				<th>Required signals</th>
+			</tr>
+		</thead>
+		<tbody>
+			<tr>
+				<td><span class="conf strong">STRONG</span></td>
+				<td>Reproducible timeout + 2 or 3 of { gadget hit, fingerprint divergence, RTT anomaly }</td>
+			</tr>
+			<tr>
+				<td><span class="conf high">CONFIRMED</span></td>
+				<td>Reproducible timeout + exactly 1 corroborator</td>
+			</tr>
+			<tr>
+				<td><span class="conf medhigh">Potential</span></td>
+				<td>Reproducible timeout only, no corroborator</td>
+			</tr>
+		</tbody>
+	</table>
+
+	<h3 style="margin: 32px 0 12px;">Worked example - Akamai edge with <code>Disallow:</code> stripped</h3>
+	<p class="sub" style="margin-bottom: 12px;">
+		The old detector used <code>/robots.txt</code> + <code>"llow:"</code> as its only
+		positive oracle. On a fronting edge that strips the <code>Disallow:</code> line,
+		that oracle silently returned False - findings landed as <em>Potential</em>
+		(timing-only) and got buried. Under the new pipeline:
+	</p>
+	<ol style="color: var(--text-dim); line-height: 1.7; padding-left: 22px;">
+		<li><code>GadgetOracle</code> walks the catalogue and picks <code>OPTIONS /</code> - baseline returns 405, gadget returns 200. Auto-derived <code>look_for</code> becomes <code>"Allow:"</code>, matched header-only.</li>
+		<li>CLTE timing oracle fires reproducibly.</li>
+		<li>Smuggled <code>OPTIONS /</code> hits the backend; victim leg comes back with <code>Content-Length</code> flipped 4287 → 0 and <code>Last-Modified</code> missing from <code>header_set</code>.</li>
+		<li><code>TimingBaseline.is_anomalous(rtt, k=3)</code> flags the response RTT well outside median + MAD.</li>
+	</ol>
+	<div class="example-finding">[postspace-09]: <span class="lbl-strong">STRONG CLTE Issue Found</span> - POST @ <span class="lbl-host">https://target.com/api</span> - default.py <span class="lbl-annot">[gadget,fp=header_set+body_len,rtt]</span></div>
+	<p style="color: var(--text-dim); font-size: 14px; margin: 0;">
+		The old code would have called this <em>Potential</em> and you'd have ignored it. The annotation makes the upgrade auditable.
+	</p>
+</section>
+
 <section id="scans" class="container">
 	<span class="label">Detection capability</span>
 	<h2>What each scanner actually does.</h2>
 	<p class="sub">
-		Every scanner pairs an anomaly oracle with a positive confirmation step.
-		Confidence reflects the strength of the corroboration, not the severity.
+		Every scanner pairs an anomaly oracle with one or more positive
+		confirmation steps. Confidence reflects the strength of the corroboration,
+		not severity.
 	</p>
 
 	<div class="matrix-wrap">
@@ -708,61 +864,61 @@ python3 webgui.py">copy</button></pre>
 				<tr>
 					<td>TE.CL / CL.TE</td>
 					<td class="scan-name"><code>tecl</code>, <code>clte</code></td>
-					<td>Timing anomaly + smuggled <code>/robots.txt</code> gadget surfacing on a victim request</td>
-					<td><span class="conf high">High when both fire</span></td>
+					<td>Timing anomaly + dynamic gadget probe + victim-leg fingerprint diff + statistical RTT baseline</td>
+					<td><span class="conf tiered">STRONG / CONFIRMED / Potential</span></td>
 				</tr>
 				<tr>
 					<td>CL.0 / 0.CL</td>
 					<td class="scan-name"><code>cl0</code></td>
-					<td>Pipelined victim observes the smuggled gadget (3-of-5 confirmations)</td>
-					<td><span class="conf high">High</span></td>
+					<td>Pipelined victim observes the smuggled gadget <strong>or</strong> victim-leg fingerprint diverges from a clean baseline; tries user method + GET + POST</td>
+					<td><span class="conf high">High (3-of-5)</span></td>
 				</tr>
 				<tr>
 					<td>TE.0</td>
 					<td class="scan-name"><code>te0</code></td>
-					<td>Victim observes the smuggled prefix after a zero-chunk terminator</td>
-					<td><span class="conf high">High</span></td>
+					<td>Victim observes the smuggled gadget <strong>or</strong> fingerprint diverges, after a zero-chunk terminator</td>
+					<td><span class="conf high">High (3-of-5)</span></td>
 				</tr>
 				<tr>
 					<td>Bare-LF / Bare-CR chunked</td>
 					<td class="scan-name"><code>bare-lf</code></td>
-					<td>Pipelined victim observes the smuggled prefix when framing uses bare LF/CR</td>
-					<td><span class="conf high">High</span></td>
+					<td>Pipelined victim observes the gadget <strong>or</strong> fingerprint diverges when framing uses bare LF/CR</td>
+					<td><span class="conf high">High (3-of-5)</span></td>
 				</tr>
 				<tr>
 					<td>Pause-based desync</td>
 					<td class="scan-name"><code>pause</code></td>
-					<td>Send headers, pause N seconds, send body; pipelined victim observes the gadget</td>
-					<td><span class="conf medhigh">Medium-high</span></td>
+					<td>Send headers, pause N s, send body; pipelined victim observes gadget <strong>or</strong> fingerprint diverges</td>
+					<td><span class="conf medhigh">Medium-high (2-of-3)</span></td>
 				</tr>
 				<tr>
 					<td>Connection-state attack</td>
 					<td class="scan-name"><code>connection-state</code></td>
-					<td>Pipelined <code>bad-Host</code> returns a different status than on a fresh connection</td>
+					<td>Status flip vs fresh connection (<code>CONNSTATE</code>) <strong>or</strong> &gt;=2-axis fingerprint divergence with confirmation (<code>CONNSTATE_FP</code>)</td>
 					<td><span class="conf med">Medium</span></td>
 				</tr>
 				<tr>
 					<td>Parser discrepancy</td>
 					<td class="scan-name"><code>parser-discrepancy</code></td>
-					<td>Technique alone matches baseline, but the canary diverges</td>
+					<td>Per-technique control + canary probe; findings annotate diff axes, <code>HIDDEN</code> downgrades to <code>PARTIAL-HIDE</code> when non-status axes also flip</td>
 					<td><span class="conf medhigh">Medium-high</span></td>
 				</tr>
 				<tr>
 					<td>Header removal (Keep-Alive)</td>
 					<td class="scan-name"><code>header-removal</code></td>
-					<td>Matched-pair comparison of harmless vs attack request (3-of-5)</td>
+					<td>Status / canary flip (<code>HDRREMOVAL</code>) <strong>or</strong> 3-of-5 reproducible fingerprint-only divergences (<code>HDRREMOVAL_FP</code>)</td>
 					<td><span class="conf medhigh">Medium-high</span></td>
 				</tr>
 				<tr>
 					<td>Expect-based desync</td>
 					<td class="scan-name"><code>expect</code></td>
-					<td>Multiple <code>Expect</code> variants pipelined with a victim; same gadget oracle as CL.0</td>
+					<td>Multiple <code>Expect</code> variants pipelined with a victim; same gadget + fingerprint oracle as CL.0</td>
 					<td><span class="conf high">High when confirmed</span></td>
 				</tr>
 				<tr>
 					<td>Hop-by-hop auth bypass</td>
 					<td class="scan-name"><code>hop-by-hop</code></td>
-					<td>Baseline vs <code>Connection: &lt;header&gt;</code> probe; status flip confirmed 2-of-3</td>
+					<td>Status flip (<code>HOPBYHOP_*</code>) <strong>or</strong> reproducible non-status fingerprint divergence (<code>HOPBYHOP_FP_*</code>)</td>
 					<td><span class="conf high">High when reproducible</span></td>
 				</tr>
 				<tr>

@@ -43,6 +43,8 @@ from lib.Scans import (
 	ScanTE0, ScanBareLFChunked, ScanHopByHop,
 )
 from lib.Oracle import GadgetOracle
+from lib.Fingerprint import Fingerprint, baseline_fingerprint, split_pipelined_responses
+from lib.Timing import TimingBaseline
 from urllib.parse import urlparse
 
 try:
@@ -474,21 +476,62 @@ class Desyncr():
 			self._oracle = oracle
 		return oracle
 
-	def _smuggle_gadget_probe(self, payload, mode):
-		"""Send a smuggling payload (CL.TE-shaped or TE.CL-shaped depending on
-		`mode`) followed by a victim GET on the same connection, then check
-		whether the victim response was contaminated by the smuggled gadget.
+	def _victim_request_str(self):
+		"""Canonical victim request used by both the baseline fingerprint
+		and the post-attack pipelined victim leg. Kept identical so
+		any diff between the two is structural, not request-driven."""
+		return (
+			"GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % (
+				self._endpoint, self._vhost or self._host
+			)
+		)
 
-		mode == "clte": front-end honors CL, backend honors TE. Smuggle a
-		            request inside what the front-end thinks is a chunk body.
-		mode == "tecl": front-end honors TE, backend honors CL.
+	def _get_victim_baseline(self):
+		"""(Fingerprint, noisy_axes) for a clean victim request. Sampled
+		once per scan; populates self._victim_fp / self._victim_noisy."""
+		fp = getattr(self, "_victim_fp", None)
+		if fp is None:
+			fp, noisy = baseline_fingerprint(
+				self._host, self._port, self.ssl_flag, self._timeout,
+				self._victim_request_str(), self._proxy, n=3,
+			)
+			self._victim_fp = fp
+			self._victim_noisy = noisy
+		return self._victim_fp, getattr(self, "_victim_noisy", set())
 
-		Returns True only when the victim response leaks a gadget signature
-		(auto-derived per target by GadgetOracle, or falls back to the
-		classic /robots.txt + "Disallow:" pair when no gadget is viable).
-		Combined with the timing oracle this drops false-positive rate
-		substantially.
+	def _get_timing_baseline(self):
+		"""Cached RTT distribution for a benign victim request. Used by
+		_confirm_timeout_anomaly to flag mutations whose RTT is
+		statistically far above the median, even when they don't trip
+		the binary timeout deadline."""
+		tb = getattr(self, "_timing_baseline", None)
+		if tb is None:
+			tb = TimingBaseline.sample(
+				self._host, self._port, self.ssl_flag, self._timeout,
+				self._victim_request_str(), self._proxy, n=5,
+			)
+			self._timing_baseline = tb
+		return tb
+
+	def _smuggle_gadget_probe_full(self, payload, mode):
+		"""Run the gadget-smuggle probe and return a dict with all
+		corroborating diff signals. The caller decides how to combine
+		them with the timing signal to produce a confidence tier.
+
+		Result keys:
+		  ``gadget_hit``        - bool, did the gadget signature appear?
+		  ``victim_fp_diverges`` - bool, did the victim response leg
+		                          structurally differ from a clean
+		                          baseline?
+		  ``axes``              - set[str], which fingerprint axes
+		                          differed (empty when no baseline or
+		                          no divergence)
+		  ``victim_resp``       - bytes/None, raw victim leg for sidecar
+		                          dumping by ``write_payload``
 		"""
+		empty = {"gadget_hit": False, "victim_fp_diverges": False,
+				"axes": set(), "victim_resp": None}
+
 		oracle = self._get_oracle()
 		og = None
 		try:
@@ -536,7 +579,7 @@ class Desyncr():
 			attack.cl = len(body)
 			attack.body = body
 		else:
-			return False
+			return empty
 
 		victim = "GET %s?vcb=%d HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % (
 			self._endpoint, random.randint(1, 1 << 30), self._vhost or self._host
@@ -549,17 +592,54 @@ class Desyncr():
 			raw = web.recv_all(self._timeout)
 			web.close()
 		except Exception:
-			return False
+			return empty
 		if not raw:
-			return False
+			return empty
+
 		try:
 			text = raw.decode('latin-1', errors='replace')
 		except Exception:
-			return False
-		# We sent two requests; the gadget signature should only appear if
-		# the backend served our smuggled gadget instead of (or in addition
-		# to) our victim.
-		return _matches(text)
+			return empty
+
+		gadget_hit = _matches(text)
+
+		# Victim-leg fingerprint diff. The recv_multiple parser knows how
+		# to split pipelined responses; we use it so a CL/TE-framed gadget
+		# response doesn't bleed into the victim leg's bytes.
+		victim_fp_diverges = False
+		axes = set()
+		victim_leg_bytes = None
+		try:
+			parts = split_pipelined_responses(raw, expected=2)
+			if len(parts) >= 2:
+				victim_leg_bytes = parts[1].encode('latin-1', errors='replace')
+				baseline_fp, noisy = self._get_victim_baseline()
+				if baseline_fp.status:  # only diff against a real baseline
+					victim_fp = Fingerprint.from_response(victim_leg_bytes)
+					axes = victim_fp.diff(baseline_fp) - noisy
+					# Require >=2 axes to flip OR a status change to count
+					# as a real structural divergence -- single-axis flips
+					# (e.g. body_tail on a date stamp the noisy_axes set
+					# missed) are too easy to false-positive on.
+					if "status" in axes or len(axes) >= 2:
+						victim_fp_diverges = True
+		except Exception:
+			pass
+
+		return {
+			"gadget_hit": gadget_hit,
+			"victim_fp_diverges": victim_fp_diverges,
+			"axes": axes,
+			"victim_resp": victim_leg_bytes,
+		}
+
+	def _smuggle_gadget_probe(self, payload, mode):
+		"""Thin wrapper preserving the legacy ``-> bool`` contract for any
+		external caller. Production callers should prefer
+		``_smuggle_gadget_probe_full`` so they see the corroborating
+		fingerprint signals."""
+		res = self._smuggle_gadget_probe_full(payload, mode)
+		return res["gadget_hit"] or res["victim_fp_diverges"]
 
 
 	def _create_exec_test(self, name, te_payload):
@@ -665,25 +745,78 @@ class Desyncr():
 				pretty_print(name, dismsg)
 				return False
 
-			# Positive smuggling oracle: try to actually surface the gadget.
-			# Failure here doesn't veto the timing finding (some backends
-			# block /robots.txt smuggling but are still desynced), but a
-			# success is much stronger evidence.
-			pretty_print(name, "Confirming %s (gadget probe)..." % kind)
-			gadget_hit = False
+			# Positive smuggling oracle: try to actually surface the gadget
+			# AND structurally fingerprint the victim leg against a clean
+			# baseline. Either signal corroborates the timing anomaly --
+			# we don't require both because edge cases exist where the
+			# gadget body is swallowed but the victim leg is empty /
+			# status-flipped, and vice versa.
+			pretty_print(name, "Confirming %s (gadget + fingerprint)..." % kind)
+			probe = {"gadget_hit": False, "victim_fp_diverges": False, "axes": set(), "victim_resp": None}
 			try:
-				gadget_hit = self._smuggle_gadget_probe(te_payload, kind.lower())
+				probe = self._smuggle_gadget_probe_full(te_payload, kind.lower())
 			except Exception:
-				gadget_hit = False
+				pass
 
-			confidence = "CONFIRMED" if gadget_hit else "Potential"
+			# Statistical timing corroboration on top of the binary
+			# timeout signal. Uses the cached per-target baseline; the
+			# anomaly RTT here is the kind_res original timing window
+			# (clte_time / tecl_time) -- it already fired the timeout
+			# (kind_res[0] == 1), but we still consult is_anomalous() so
+			# the confidence tier reflects whether the spike was
+			# statistically significant beyond just "exceeded our
+			# arbitrary 5s deadline".
+			rtt_anomalous = False
+			try:
+				tb = self._get_timing_baseline()
+				anomaly_rtt = clte_time if kind == "CLTE" else tecl_time
+				rtt_anomalous = tb.is_anomalous(anomaly_rtt, k=3.0)
+			except Exception:
+				rtt_anomalous = False
+
+			# Signal tally: timing-reproducible is already a given (we
+			# returned False above otherwise). The other three are
+			# corroborators.
+			signals = {
+				"gadget": probe["gadget_hit"],
+				"fingerprint": probe["victim_fp_diverges"],
+				"rtt": rtt_anomalous,
+			}
+			vote_count = sum(1 for v in signals.values() if v)
+
+			# Tiered confidence:
+			#   STRONG    - timing-reproducible + 2 or 3 corroborators
+			#   CONFIRMED - timing-reproducible + exactly 1 corroborator
+			#   Potential - timing-reproducible only, no corroborator
+			if vote_count >= 2:
+				confidence = "STRONG"
+			elif vote_count == 1:
+				confidence = "CONFIRMED"
+			else:
+				confidence = "Potential"
+
+			# Build a compact signal annotation for the operator: which
+			# corroborators fired and (for the fingerprint signal) which
+			# axes diverged.
+			annot_parts = []
+			if signals["gadget"]:
+				annot_parts.append("gadget")
+			if signals["fingerprint"]:
+				if probe["axes"]:
+					annot_parts.append("fp=" + "+".join(sorted(probe["axes"])))
+				else:
+					annot_parts.append("fp")
+			if signals["rtt"]:
+				annot_parts.append("rtt")
+			annot = ("[" + ",".join(annot_parts) + "]") if annot_parts else ""
+
 			scheme = ["http://", "https://"][self.ssl_flag]
 			dismsg = (
 				Fore.RED + ("%s %s Issue Found" % (confidence, kind))
 				+ Fore.MAGENTA + " - " + Fore.CYAN + self._method
 				+ Fore.MAGENTA + " @ " + Fore.CYAN + scheme + self._host + self._endpoint
 				+ Fore.MAGENTA + " - " + Fore.CYAN + self._configfile.split('/')[-1]
-				+ ("" if not gadget_hit else Fore.MAGENTA + " [gadget=/robots.txt]")
+				+ ((Fore.MAGENTA + " " + annot) if annot else "")
 				+ "\n"
 			)
 			pretty_print(name, dismsg)
@@ -693,7 +826,7 @@ class Desyncr():
 				status_code=kind_res[0],
 				timing=clte_time if kind == "CLTE" else tecl_time,
 				confidence=confidence,
-				gadget_hit=gadget_hit,
+				gadget_hit=probe["gadget_hit"],
 			)
 			return True
 

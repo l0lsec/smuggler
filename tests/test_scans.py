@@ -169,3 +169,39 @@ def test_scan_hopbyhop_negative(server_factory):
 	found = scanner.run(_print_capture(prints), _write_capture(writes))
 	assert found is False
 	assert writes == []
+
+
+# ----- Fingerprint-only detection paths ----------------------------------
+
+def test_scan_hopbyhop_fp_only_detection(server_factory):
+	# Server returns 200 either way -- old status-only oracle missed
+	# this. New code must catch the Set-Cookie / body-length flip via
+	# the fingerprint corroborator.
+	port = server_factory("hopbyhop_fp_only")
+	prints, writes = [], []
+	scanner = ScanHopByHop(**_common_kwargs(port))
+	# Inject Authorization into baseline so subsequent strip is observable.
+	orig = scanner._request
+	def _wrapped(extra):
+		return orig(["Authorization: Bearer good"] + extra)
+	scanner._request = _wrapped
+
+	found = scanner.run(_print_capture(prints), _write_capture(writes))
+	assert found is True
+	# Subtle-strip path emits the HOPBYHOP_FP_* payload tag.
+	assert any(ptype.startswith("HOPBYHOP_FP_") for _h, ptype, _p in writes), \
+		"expected HOPBYHOP_FP_* payload, got: %r" % [t for _h, t, _p in writes]
+
+
+def test_scan_header_removal_fp_only_detection(server_factory):
+	# Server returns 200 + canary in both legs; old code's
+	# status-and-canary oracle would have flagged nothing. New code's
+	# fp-only path detects the extra X-Edge header + body-length flip.
+	port = server_factory("header_removal_fp")
+	prints, writes = [], []
+	scanner = ScanHeaderRemoval(**_common_kwargs(port))
+
+	found = scanner.run(_print_capture(prints), _write_capture(writes))
+	assert found is True
+	assert any(ptype == "HDRREMOVAL_FP" for _h, ptype, _p in writes), \
+		"expected HDRREMOVAL_FP payload, got: %r" % [t for _h, t, _p in writes]

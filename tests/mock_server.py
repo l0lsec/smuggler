@@ -15,6 +15,13 @@ Behaviors:
   parser_disc_space    - treats " Header: x" (leading space) as a separate
                          visible header that affects routing
   hopbyhop_strip       - strips Authorization when Connection lists it
+  hopbyhop_fp_only     - returns 200 either way, but adds Set-Cookie / drops
+                         a header when Connection: Authorization is sent
+                         (no status change -- old status-only oracle missed
+                         this, fingerprint diff catches it)
+  header_removal_fp    - returns 200 + canary in both responses, but the
+                         response with Keep-Alive has an extra X-Edge header
+                         and a longer body (fingerprint-only divergence)
 """
 
 import socketserver
@@ -257,6 +264,56 @@ class _Handler(socketserver.BaseRequestHandler):
 						conn.sendall(DEFAULT_RESPONSE)
 					else:
 						conn.sendall(UNAUTH_RESPONSE)
+
+				elif behavior == "hopbyhop_fp_only":
+					# Same 200 either way (so the legacy status-only
+					# oracle says "no finding"), but when the request
+					# carries `Connection: <anything>` we add a
+					# Set-Cookie and lengthen the body so the
+					# fingerprint diff fires on both header_set and
+					# body_len axes.
+					conn_hdr = headers.get(b"connection", [b""])[0].lower()
+					if b"authorization" in conn_hdr or b"cookie" in conn_hdr:
+						body_resp = b"hello-extended\n"
+						resp = (
+							b"HTTP/1.1 200 OK\r\n"
+							b"Content-Type: text/plain\r\n"
+							b"Set-Cookie: edge=stripped\r\n"
+							b"Content-Length: %d\r\n"
+							b"Connection: keep-alive\r\n"
+							b"\r\n" % len(body_resp)
+						) + body_resp
+						conn.sendall(resp)
+					else:
+						conn.sendall(DEFAULT_RESPONSE)
+
+				elif behavior == "header_removal_fp":
+					# Both responses are 200 with the canary body
+					# echoed back (so status + canary-presence match),
+					# but the Keep-Alive variant adds an X-Edge header
+					# AND lengthens the body. Tests the
+					# fingerprint-only HDRREMOVAL_FP path.
+					if b"keep-alive" in headers:
+						resp_body = (body or b"empty") + b"-edge-suffix"
+						resp = (
+							b"HTTP/1.1 200 OK\r\n"
+							b"Content-Type: text/plain\r\n"
+							b"X-Edge: served\r\n"
+							b"Content-Length: %d\r\n"
+							b"Connection: keep-alive\r\n"
+							b"\r\n" % len(resp_body)
+						) + resp_body
+						conn.sendall(resp)
+					else:
+						resp_body = body or b"empty"
+						resp = (
+							b"HTTP/1.1 200 OK\r\n"
+							b"Content-Type: text/plain\r\n"
+							b"Content-Length: %d\r\n"
+							b"Connection: keep-alive\r\n"
+							b"\r\n" % len(resp_body)
+						) + resp_body
+						conn.sendall(resp)
 
 				else:
 					conn.sendall(ERROR_RESPONSE)
