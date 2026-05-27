@@ -42,6 +42,7 @@ from lib.Scans import (
 	ScanParserDiscrepancy, ScanHeaderRemoval, ScanExpectDesync,
 	ScanTE0, ScanBareLFChunked, ScanHopByHop,
 )
+from lib.Oracle import GadgetOracle
 from urllib.parse import urlparse
 
 try:
@@ -334,6 +335,21 @@ class Desyncr():
 
 		vhost = self._vhost if self._vhost else self._host
 
+		# Build a single per-target gadget oracle and share it across every
+		# scanner. The first scanner that calls oracle.select() pays the
+		# probe cost (typically 4-6 small requests); every other scanner
+		# in this run reuses the cached gadget.
+		oracle = self._get_oracle()
+		try:
+			chosen = oracle.select()
+			if chosen is not None:
+				adv_print("Oracle", "Gadget=%s path=%r look_for=%r (%s)" % (
+					chosen.name, chosen.smuggle_path, chosen.look_for, chosen.rationale))
+			else:
+				adv_print("Oracle", "No viable gadget; scanners will use legacy /robots.txt + 'llow:' fallback")
+		except Exception as e:
+			adv_print("Oracle", "Probe failed (%s); falling back to legacy gadget" % str(e))
+
 		scan_map = {
 			"cl0": ScanCL0,
 			"pause": ScanPauseDesync,
@@ -368,13 +384,14 @@ class Desyncr():
 				scanner = scan_cls(
 					self._host, self._port, self.ssl_flag, self._timeout,
 					self._method, self._endpoint, vhost, self._proxy,
-					self._logh, self._quiet, self._cookies, pause_timeout
+					self._logh, self._quiet, self._cookies, pause_timeout,
+					oracle=oracle,
 				)
 			else:
 				scanner = scan_cls(
 					self._host, self._port, self.ssl_flag, self._timeout,
 					self._method, self._endpoint, vhost, self._proxy,
-					self._logh, self._quiet, self._cookies
+					self._logh, self._quiet, self._cookies, oracle=oracle,
 				)
 			scanner.run(adv_print, adv_write)
 
@@ -437,6 +454,26 @@ class Desyncr():
 				return False
 		return True
 
+	def _get_oracle(self):
+		"""Lazily construct and cache a per-target gadget oracle. The
+		first call probes the catalogue (a handful of small requests);
+		every subsequent call returns the cached selection."""
+		oracle = getattr(self, "_oracle", None)
+		if oracle is None:
+			oracle = GadgetOracle(
+				host=self._host,
+				port=self._port,
+				ssl_flag=self.ssl_flag,
+				timeout=self._timeout,
+				vhost=self._vhost or self._host,
+				proxy=self._proxy,
+				baseline_method=self._method,
+				baseline_endpoint=self._endpoint,
+				quiet=self._quiet,
+			)
+			self._oracle = oracle
+		return oracle
+
 	def _smuggle_gadget_probe(self, payload, mode):
 		"""Send a smuggling payload (CL.TE-shaped or TE.CL-shaped depending on
 		`mode`) followed by a victim GET on the same connection, then check
@@ -446,15 +483,35 @@ class Desyncr():
 		            request inside what the front-end thinks is a chunk body.
 		mode == "tecl": front-end honors TE, backend honors CL.
 
-		Returns True only when the victim response leaks /robots.txt's
-		`Disallow` line that we never asked for. Combined with the timing
-		oracle this drops false-positive rate substantially.
+		Returns True only when the victim response leaks a gadget signature
+		(auto-derived per target by GadgetOracle, or falls back to the
+		classic /robots.txt + "Disallow:" pair when no gadget is viable).
+		Combined with the timing oracle this drops false-positive rate
+		substantially.
 		"""
-		gadget_path = "/robots.txt"
-		gadget_token = "llow:"
-		smuggled = "GET %s HTTP/1.1\r\nHost: %s\r\nX-Smug: 1\r\n\r\n" % (
-			gadget_path, self._vhost or self._host
-		)
+		oracle = self._get_oracle()
+		og = None
+		try:
+			og = oracle.select()
+		except Exception:
+			og = None
+
+		vhost = self._vhost or self._host
+		if og is not None:
+			path = og.smuggle_path
+			method = og.method
+			if path == "*":
+				smuggled = "%s * HTTP/1.1\r\nHost: %s\r\nX-Smug: 1\r\n\r\n" % (method, vhost)
+			else:
+				smuggled = "%s %s HTTP/1.1\r\nHost: %s\r\nX-Smug: 1\r\n\r\n" % (method, path, vhost)
+
+			def _matches(text):
+				return og.matches(text)
+		else:
+			smuggled = "GET /robots.txt HTTP/1.1\r\nHost: %s\r\nX-Smug: 1\r\n\r\n" % vhost
+
+			def _matches(text):
+				return "llow:" in text
 
 		attack = deepcopy(payload)
 		attack.host = self._vhost or self._host
@@ -499,9 +556,10 @@ class Desyncr():
 			text = raw.decode('latin-1', errors='replace')
 		except Exception:
 			return False
-		# We sent two requests; the gadget token should only appear if the
-		# backend served /robots.txt instead of (or in addition to) our victim.
-		return gadget_token in text
+		# We sent two requests; the gadget signature should only appear if
+		# the backend served our smuggled gadget instead of (or in addition
+		# to) our victim.
+		return _matches(text)
 
 
 	def _create_exec_test(self, name, te_payload):
@@ -521,7 +579,9 @@ class Desyncr():
 					self._logh.flush()
 
 
-		def write_payload(smhost, payload, ptype):
+		def write_payload(smhost, payload, ptype, response=None,
+				status_code=None, timing=None, confidence=None,
+				gadget_hit=False):
 			furl = smhost.replace('.', '_')
 			if (self.ssl_flag):
 				furl = "https_" + furl
@@ -536,6 +596,52 @@ class Desyncr():
 			(Fore.MAGENTA+ptype, Fore.CYAN+fname+Fore.MAGENTA, Fore.CYAN+self._url))
 			with open(fname, 'wb') as file:
 				file.write(bytes(str(payload),'utf-8'))
+
+			# ---- Sidecars for the web GUI's View dialog -------------------
+			# The .txt above is only the REQUEST bytes. Without these
+			# sidecars the GUI has no way to surface what came back, the
+			# timing window, or whether the gadget oracle fired.
+			#
+			# We ALWAYS write .response.txt — even when response is None or
+			# empty — so the GUI can distinguish "smuggler captured nothing
+			# back (the hang IS the desync signal)" from "we never recorded
+			# this run". The status_label in .meta.json tells the GUI which
+			# interpretation applies (timeout / disconnect / error / normal).
+			base = fname[:-4]  # strip ".txt"
+			try:
+				if response is None:
+					resp_bytes = b""
+				elif isinstance(response, (bytes, bytearray)):
+					resp_bytes = bytes(response)
+				else:
+					resp_bytes = str(response).encode('utf-8', errors='replace')
+				with open(base + ".response.txt", 'wb') as f:
+					f.write(resp_bytes)
+			except OSError:
+				pass
+			try:
+				import json as _json, datetime as _dt
+				status_label = {0: "normal", 1: "timeout",
+					2: "disconnect", -1: "error"}.get(status_code, "unknown")
+				meta = {
+					"kind": ptype,
+					"mutation": name,
+					"url": self._url,
+					"method": self._method,
+					"configfile": self._configfile.split('/')[-1],
+					"confidence": confidence,
+					"gadget_hit": bool(gadget_hit),
+					"status_code": status_code,
+					"status_label": status_label,
+					"timing_s": round(timing, 3) if timing is not None else None,
+					"request_bytes": len(str(payload).encode('utf-8', errors='replace')),
+					"response_bytes": len(response) if response else 0,
+					"timestamp": _dt.datetime.utcnow().isoformat() + "Z",
+				}
+				with open(base + ".meta.json", 'w') as f:
+					_json.dump(meta, f, indent=2)
+			except OSError:
+				pass
 
 		# Initial probe pair
 		pretty_print(name, "Checking TECL...")
@@ -581,7 +687,14 @@ class Desyncr():
 				+ "\n"
 			)
 			pretty_print(name, dismsg)
-			write_payload(self._host, kind_res[2], kind)
+			write_payload(
+				self._host, kind_res[2], kind,
+				response=kind_res[1],
+				status_code=kind_res[0],
+				timing=clte_time if kind == "CLTE" else tecl_time,
+				confidence=confidence,
+				gadget_hit=gadget_hit,
+			)
 			return True
 
 		if clte_res[0] == 1:

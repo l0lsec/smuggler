@@ -151,7 +151,7 @@ dmypy.json
 cython_debug/
 
 # Smuggler results
-payloads/*.txt
+payloads/
 tests/req3.txt
 tests/req1.txt
 tests/req2.txt

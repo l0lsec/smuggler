@@ -266,7 +266,7 @@ its oracle type, and the confidence you can place in a positive finding.
 
 | Attack class | Scanner (`--scan-type`) | Oracle | Confidence |
 | --- | --- | --- | --- |
-| TE.CL / CL.TE | `tecl`, `clte` (default) | Timing anomaly + positive gadget-smuggle probe (when the smuggled `GET /robots.txt` surfaces on a victim request) | High when both signals fire; medium on timing alone |
+| TE.CL / CL.TE | `tecl`, `clte` (default) | Timing anomaly + positive gadget-smuggle probe (uses the dynamic `GadgetOracle` -- see below) | High when both signals fire; medium on timing alone |
 | CL.0 / 0.CL | `cl0` | Pipelined victim request observes the smuggled gadget; tries the user's method + GET + POST | High (3-of-5 confirmations required) |
 | TE.0 | `te0` | Pipelined victim request observes the smuggled gadget after a zero-chunk terminator | High (3-of-5) |
 | Bare-LF / Bare-CR chunked | `bare-lf` | Pipelined victim observes the smuggled prefix when chunk framing uses bare LF/CR | High (3-of-5) |
@@ -277,6 +277,52 @@ its oracle type, and the confidence you can place in a positive finding.
 | Expect-based desync | `expect` | Multiple Expect variants pipelined with a victim; same gadget oracle as CL.0 | High when confirmed |
 | Hop-by-hop auth bypass | `hop-by-hop` | Baseline vs `Connection: <header>` probe; status flip confirmed 2-of-3 | High when reproducible |
 | HTTP/2 downgrade | `h2` (or `--http2`) | Sends the H2 attack stream, then opens a parallel H1 connection and checks whether the victim received the gadget response | High (was previously low/wrong - see "HTTP/2 oracle" below) |
+
+### Dynamic gadget oracle
+
+Every gadget-based scanner (`tecl`/`clte`, `cl0`, `te0`, `bare-lf`,
+`expect`, `pause`) shares a single per-target `GadgetOracle`
+(`lib/Oracle.py`). On the first call it walks a candidate catalogue --
+`OPTIONS *`, `OPTIONS /`, a randomized 404 probe, `/robots.txt`,
+`/favicon.ico`, `/sitemap.xml`, and a query-reflection probe -- picks
+the first response that successfully diverges from a baseline of the
+real target endpoint, and auto-derives a `look_for` signature using
+(in priority order):
+
+1. **Per-run canary reflection.** The oracle injects a random token
+   (`smug=<8-char-canary>`) into the gadget URL where the gadget
+   supports a query string. If the response reflects the token, that
+   token is the signature -- no chance of accidental collision.
+2. **Status-code divergence.** When the gadget returns a different
+   status than the baseline (e.g. gadget=`200`, baseline=`404`), the
+   signature becomes `HTTP/1.1<code>`, matched header-only.
+3. **Distinctive response header.** A header name present in the gadget
+   response but absent from baseline (`Allow:`, `Last-Modified:`, etc.)
+   becomes the signature.
+4. **Body n-gram diff.** Failing the above, the longest printable
+   8-byte-or-greater token unique to the gadget body is selected.
+5. **Static fallback.** The candidate's hard-coded literal (e.g.
+   `"llow:"` for `/robots.txt`) is used only when every other
+   derivation fails.
+
+In addition, every signature includes `HTTP/1.1 405` as an alternate so
+the classic *"smuggled request reached the backend but was rejected"*
+tell still fires. The selected gadget is cached for the rest of the
+scan run; the probe cost (4-6 small GETs) is paid once.
+
+This replaces the previous hard-coded `GET /robots.txt` + `"llow:"`
+pair, which silently failed on targets that:
+
+- don't serve `/robots.txt`
+- route `/robots.txt` to a different upstream than the target endpoint
+- strip the `Disallow:` line at the edge
+- happen to have `"llow:"` in their normal response (`allow:` CSP
+  directives, Bootstrap CSS, etc.) -- which manifested as a false
+  positive
+
+When no candidate is viable (target completely unreachable, all probes
+returning 5xx) the scanners transparently fall back to the legacy pair
+so behavior never regresses below the prior baseline.
 
 ### HTTP/2 oracle
 

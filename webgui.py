@@ -454,6 +454,22 @@ def _parse_payload_meta(path: Path) -> dict:
 	parts = stem.split("_")
 	scan_type = parts[-2] if len(parts) >= 3 else "?"
 	mutation = parts[-1] if len(parts) >= 2 else "?"
+	# Sidecar files written by smuggler when it dumps the payload — give
+	# the GUI's View dialog the response that came back and run-time
+	# metadata (timing, confidence, gadget_hit, status_label).
+	base = str(path)[:-4] if str(path).endswith(".txt") else str(path)
+	response_raw: Optional[bytes] = None
+	try:
+		response_raw = Path(base + ".response.txt").read_bytes()
+	except (OSError, FileNotFoundError):
+		response_raw = None
+	sidecar_meta: dict = {}
+	try:
+		import json as _json
+		sidecar_meta = _json.loads(
+			Path(base + ".meta.json").read_text(encoding="utf-8"))
+	except (OSError, FileNotFoundError, ValueError):
+		sidecar_meta = {}
 	return {
 		"raw": raw,
 		"scheme": scheme,
@@ -461,6 +477,8 @@ def _parse_payload_meta(path: Path) -> dict:
 		"host": host,
 		"scan_type": scan_type,
 		"mutation": mutation,
+		"response_raw": response_raw,
+		"sidecar_meta": sidecar_meta,
 	}
 
 
@@ -884,6 +902,15 @@ def _repro_cmd_for_payload(path: Path, meta: dict) -> str:
 @ui.page("/")
 def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bottom
 	ui.add_head_html(f"<style>{LOG_CSS}</style>")
+	# NiceGUI 3.x requires an explicit client context whenever UI is mutated
+	# from a background task. Our subprocess streamer (`stream_process`) runs
+	# as an `asyncio.create_task(...)` and its `on_line` / `on_status` /
+	# `on_exit` callbacks have no slot stack of their own, so every
+	# `ui.notify(...)` / `findings_box.clear()` would raise
+	# "The current slot cannot be determined because the slot stack for this
+	# task is empty." Capture the client here while we ARE on the page-handler
+	# stack and re-enter it from those callbacks via `with page_client:`.
+	page_client = ui.context.client
 	cfg = RunConfig()
 	state = RunState()
 	# UI handles captured by closures further down
@@ -1158,6 +1185,10 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 					with ui.row().classes("gap-2 items-center"):
 						findings_summary = ui.label("0 confirmed • 0 to confirm") \
 							.classes("text-xs text-gray-500")
+						ui.button("Backfill", icon="restore",
+							on_click=lambda: backfill_findings_from_disk()) \
+							.props("flat dense") \
+							.tooltip("Create findings from existing payloads/*.txt")
 						ui.button("Copy as Markdown", icon="article",
 							on_click=lambda: _export_findings_md()) \
 							.props("flat dense")
@@ -1167,9 +1198,14 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 			with ui.card().classes("w-full"):
 				with ui.row().classes("w-full items-center justify-between"):
 					ui.label("Output").classes("text-base font-semibold")
-					ui.label("").bind_text_from(state, "started_at",
-						backward=lambda t: f"started {time.strftime('%H:%M:%S', time.localtime(t))}" if t else "") \
-						.classes("text-xs text-gray-500")
+					with ui.row().classes("gap-2 items-center"):
+						ui.label("").bind_text_from(state, "started_at",
+							backward=lambda t: f"started {time.strftime('%H:%M:%S', time.localtime(t))}" if t else "") \
+							.classes("text-xs text-gray-500")
+						ui.button("Copy", icon="content_copy",
+							on_click=lambda: copy_log_to_clipboard()) \
+							.props("flat dense") \
+							.tooltip("Copy output log to clipboard")
 				# sanitize=False: we control the HTML we inject (it's our own
 				# ANSI->span output where the text payload is html.escape()'d
 				# inside ansi_to_html). NiceGUI 3.x requires this kwarg.
@@ -1194,6 +1230,12 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 	def push_log(text: str) -> None:
 		if not text:
 			return
+		# Background-task callbacks must enter the page's client context
+		# explicitly or NiceGUI raises "slot stack is empty".
+		with page_client:
+			_push_log_inside(text)
+
+	def _push_log_inside(text: str) -> None:
 		# Parse before mutating HTML — findings panel is the user-facing
 		# output, log is the debug view.
 		_record_finding_from_line(text)
@@ -1262,27 +1304,53 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 		if log_box is not None:
 			log_box.content = ""
 
+	def copy_log_to_clipboard() -> None:
+		# Grab the rendered text (browser converts our ANSI spans to plain
+		# text via innerText), strip the per-line copy markers we never add,
+		# and hand it to the clipboard. Doing it in JS avoids shipping the
+		# whole log buffer through a server-side round-trip.
+		if not log_html_chunks:
+			ui.notify("Output log is empty.", type="warning")
+			return
+		ui.run_javascript(
+			"(async () => {"
+			"  const el = document.querySelector('.smug-log');"
+			"  if (!el) return;"
+			"  const txt = el.innerText || el.textContent || '';"
+			"  try { await navigator.clipboard.writeText(txt); }"
+			"  catch (e) {"
+			"    const ta = document.createElement('textarea');"
+			"    ta.value = txt; document.body.appendChild(ta);"
+			"    ta.select(); document.execCommand('copy');"
+			"    document.body.removeChild(ta);"
+			"  }"
+			"})();"
+		)
+		ui.notify("Output copied to clipboard")
+
 	def push_status(groups: dict) -> None:
-		stats_lbls["total"].set_text(groups["total"])
-		stats_lbls["success"].set_text(groups["success"])
-		stats_lbls["failed"].set_text(groups["failed"])
-		stats_lbls["timeout"].set_text(groups["timeout"])
-		stats_lbls["error"].set_text(groups["error"])
-		stats_lbls["rps"].set_text(groups["rps"])
-		if groups.get("base_total"):
-			baseline_lbl.set_text(f"{groups['base_ok']} / {groups['base_total']}")
-			baseline_row.set_visibility(True)
-		else:
-			baseline_row.set_visibility(False)
-		latest_id_lbl.set_text(f"Latest request: {groups['id']}")
+		with page_client:
+			stats_lbls["total"].set_text(groups["total"])
+			stats_lbls["success"].set_text(groups["success"])
+			stats_lbls["failed"].set_text(groups["failed"])
+			stats_lbls["timeout"].set_text(groups["timeout"])
+			stats_lbls["error"].set_text(groups["error"])
+			stats_lbls["rps"].set_text(groups["rps"])
+			if groups.get("base_total"):
+				baseline_lbl.set_text(f"{groups['base_ok']} / {groups['base_total']}")
+				baseline_row.set_visibility(True)
+			else:
+				baseline_row.set_visibility(False)
+			latest_id_lbl.set_text(f"Latest request: {groups['id']}")
 
 	def on_exit(rc: int) -> None:
-		status_label.set_text(f"Exited (rc={rc})")
-		start_btn.set_visibility(True)
-		stop_btn.set_visibility(False)
-		refresh_payloads(force=True)
-		ui.notify(f"Smuggler finished (exit code {rc})",
-			type="positive" if rc == 0 else "warning")
+		with page_client:
+			status_label.set_text(f"Exited (rc={rc})")
+			start_btn.set_visibility(True)
+			stop_btn.set_visibility(False)
+			refresh_payloads(force=True)
+			ui.notify(f"Smuggler finished (exit code {rc})",
+				type="positive" if rc == 0 else "warning")
 
 	async def on_start() -> None:
 		if state.is_running():
@@ -1341,23 +1409,33 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 
 	# ---- Payload viewer dialog (built once, reused per click) ----
 	#
-	# We render two views: a text view with non-printables highlighted (the
-	# "what byte makes this work" view) and a classic hex dump. Findings
-	# almost always hinge on a single byte that's invisible in plain text,
-	# so the text view alone is misleading.
-	with ui.dialog() as payload_dlg, ui.card().classes("w-[960px] max-w-[95vw]"):
+	# Four panels: REQUEST annotated text, REQUEST hex dump, RESPONSE
+	# annotated text, RESPONSE hex dump. The request comes from the
+	# payload .txt; the response and run-time metadata (status, timing,
+	# confidence, gadget hit) come from the sibling .response.txt and
+	# .meta.json sidecars that smuggler writes alongside.
+	with ui.dialog() as payload_dlg, ui.card().classes("w-[1000px] max-w-[95vw]"):
 		pd_title = ui.label("").classes("text-base font-semibold font-mono break-all")
 		pd_meta = ui.label("").classes("text-xs text-gray-500")
+		pd_meta2 = ui.label("").classes("text-xs text-gray-400 mt-1")
 		ui.separator()
 		with ui.tabs().classes("w-full") as pd_tabs:
-			pd_tab_text = ui.tab("text", label="Annotated text")
-			pd_tab_hex = ui.tab("hex", label="Hex dump")
-		with ui.tab_panels(pd_tabs, value=pd_tab_text).classes("w-full"):
-			with ui.tab_panel(pd_tab_text):
-				pd_text = ui.html("", sanitize=False).classes(
+			pd_tab_req_text = ui.tab("req_text", label="Request — annotated")
+			pd_tab_req_hex = ui.tab("req_hex", label="Request — hex")
+			pd_tab_res_text = ui.tab("res_text", label="Response — annotated")
+			pd_tab_res_hex = ui.tab("res_hex", label="Response — hex")
+		with ui.tab_panels(pd_tabs, value=pd_tab_req_text).classes("w-full"):
+			with ui.tab_panel(pd_tab_req_text):
+				pd_req_text = ui.html("", sanitize=False).classes(
 					"smug-log w-full whitespace-pre-wrap")
-			with ui.tab_panel(pd_tab_hex):
-				pd_hex = ui.html("", sanitize=False).classes(
+			with ui.tab_panel(pd_tab_req_hex):
+				pd_req_hex = ui.html("", sanitize=False).classes(
+					"smug-log w-full whitespace-pre")
+			with ui.tab_panel(pd_tab_res_text):
+				pd_res_text = ui.html("", sanitize=False).classes(
+					"smug-log w-full whitespace-pre-wrap")
+			with ui.tab_panel(pd_tab_res_hex):
+				pd_res_hex = ui.html("", sanitize=False).classes(
 					"smug-log w-full whitespace-pre")
 		ui.separator()
 		with ui.row().classes("w-full justify-between items-center"):
@@ -1370,14 +1448,151 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 
 	def view_payload(path: Path) -> None:
 		meta = _parse_payload_meta(path)
+		side = meta.get("sidecar_meta") or {}
+		resp = meta.get("response_raw")
 		pd_title.set_text(path.name)
+		# Build the response-bytes summary. Three states:
+		#   - resp bytes present  → "response: N bytes"
+		#   - resp empty/None but sidecar says timeout/disconnect/error
+		#                          → "response: (back-end hung/closed — see tab)"
+		#   - resp None and no sidecar (legacy)
+		#                          → "response: (not captured)"
+		_sl = (side.get("status_label") or "").lower()
+		if resp is not None and len(resp) > 0:
+			resp_summary = f"response: {len(resp)} bytes"
+		elif _sl == "timeout":
+			resp_summary = "response: (back-end hung, no bytes received)"
+		elif _sl == "disconnect":
+			resp_summary = "response: (back-end closed, no bytes received)"
+		elif _sl == "error":
+			resp_summary = "response: (socket error)"
+		elif resp is not None:
+			resp_summary = "response: 0 bytes"
+		else:
+			resp_summary = "response: (not captured)"
 		pd_meta.set_text(
 			f"{meta['scheme']}://{meta.get('host') or '?'}:{meta['port']}"
 			f"   |   scan: {meta['scan_type']}   |   mutation: {meta['mutation']}"
-			f"   |   {len(meta['raw'])} bytes"
+			f"   |   request: {len(meta['raw'])} bytes   |   {resp_summary}"
 		)
-		pd_text.content = _render_text_html(meta["raw"])
-		pd_hex.content = _render_hex_html(meta["raw"])
+		# Second meta line: run-time context from .meta.json (when present)
+		if side:
+			parts = []
+			conf = side.get("confidence")
+			if conf:
+				parts.append(f"confidence: {str(conf).upper()}")
+			if side.get("gadget_hit"):
+				parts.append("gadget: HIT")
+			if side.get("status_label"):
+				parts.append(f"status: {side['status_label']}")
+			if side.get("timing_s") is not None:
+				parts.append(f"timing: {side['timing_s']:.3f}s")
+			if side.get("timestamp"):
+				parts.append(side["timestamp"].replace("T", " ").rstrip("Z"))
+			pd_meta2.set_text("   |   ".join(parts))
+			pd_meta2.set_visibility(True)
+		else:
+			pd_meta2.set_text("")
+			pd_meta2.set_visibility(False)
+
+		# Request panels
+		pd_req_text.content = _render_text_html(meta["raw"])
+		pd_req_hex.content = _render_hex_html(meta["raw"])
+
+		# Response panels — four cases:
+		#   1) No response sidecar AND no meta sidecar  → legacy payload
+		#      (was dumped before sidecar capture was added).
+		#   2) Response sidecar exists, length > 0      → render normally.
+		#   3) Response sidecar exists, length == 0,
+		#      AND meta says status was timeout/disconnect/error → the
+		#      hang IS the desync signal; render a status-aware diagnostic.
+		#   4) Response sidecar exists, length == 0, status == normal →
+		#      back-end sent a zero-length body (rare but possible).
+		status_label = (side.get("status_label") or "").lower()
+		timing_s = side.get("timing_s")
+
+		if resp is None and not side:
+			# Case 1: pre-sidecar legacy payload
+			placeholder = (
+				'<div style="padding:14px;color:#fde68a;line-height:1.6">'
+				'<strong>Response not captured for this payload.</strong><br><br>'
+				'This payload was dumped before sidecar capture was enabled '
+				'(or by a scanner class that does not yet store responses).<br>'
+				'Re-run the scan to capture future responses automatically, '
+				'or use the <em>Copy repro cmd</em> button below to fetch '
+				'the response on the wire right now.'
+				'</div>'
+			)
+			pd_res_text.content = placeholder
+			pd_res_hex.content = placeholder
+		elif (resp is None or len(resp) == 0) and status_label in (
+				"timeout", "disconnect", "error"):
+			# Case 3: the hang/disconnect IS the desync signal — explain
+			# rather than just saying "empty".
+			if status_label == "timeout":
+				headline = (
+					"The back-end never sent a response."
+					if timing_s is None
+					else f"The back-end hung for {timing_s:.3f}s without "
+						"sending anything back, and the socket timed out."
+				)
+				explanation = (
+					"This <strong>is</strong> the desync signal. The back-end "
+					"is sitting on the socket waiting for the rest of the "
+					"chunked body that the front-end already decided was "
+					"complete — classic CL.TE / TE.CL behaviour. There is "
+					"literally no response to show."
+				)
+			elif status_label == "disconnect":
+				headline = (
+					"The back-end closed the connection without sending a "
+					"response"
+					+ ("." if timing_s is None
+						else f" after {timing_s:.3f}s.")
+				)
+				explanation = (
+					"A clean RST/FIN before the timeout window often means "
+					"the back-end's HTTP parser rejected the smuggled frame "
+					"(invalid chunk size, length mismatch, etc.). Worth "
+					"capturing the request on a proxy to see the back-end "
+					"error verbatim if you have access."
+				)
+			else:  # error
+				headline = "The request raised a socket-level exception."
+				explanation = (
+					"This is usually TLS, DNS, or proxy-side; less commonly "
+					"a desync. Re-run with <code>-v</code> to see the "
+					"underlying error."
+				)
+			diag = (
+				f'<div style="padding:14px;color:#fde68a;line-height:1.6">'
+				f'<strong>{headline}</strong><br><br>{explanation}<br><br>'
+				f'<span style="color:#9ca3af">'
+				f'status: <strong>{status_label}</strong>'
+				+ (f' • timing: <strong>{timing_s:.3f}s</strong>'
+					if timing_s is not None else '')
+				+ ' • response bytes: <strong>0</strong>'
+				+ '</span></div>'
+			)
+			pd_res_text.content = diag
+			pd_res_hex.content = diag
+		else:
+			# Cases 2 and 4: render whatever bytes we have.
+			data = resp if resp is not None else b""
+			cap = 32 * 1024
+			view = data[:cap]
+			note = ""
+			if len(data) > cap:
+				note = (f'<div style="color:#fde68a;padding:6px 10px">'
+					f'(showing first {cap} of {len(data)} bytes — full '
+					f'response on disk in {path.name[:-4]}.response.txt)'
+					f'</div>')
+			elif len(data) == 0:
+				note = ('<div style="color:#fde68a;padding:6px 10px">'
+					'(back-end returned a zero-length body)</div>')
+			pd_res_text.content = note + _render_text_html(view)
+			pd_res_hex.content = note + _render_hex_html(view)
+
 		repro = _repro_cmd_for_payload(path, meta)
 		pd_repro.set_text("$ " + repro)
 		pd_copy_btn.on_click(lambda _=None, c=repro: (
@@ -1557,6 +1772,107 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 			"Needs manual confirmation", "text-amber-500",
 			"help_outline", potential)
 
+	def _classify_payload_for_backfill(meta_dict: dict) -> tuple[str, str]:
+		"""Given a parsed payload (filename + sidecar), guess scan label
+		and confidence. Used when we don't have the original stdout line
+		(legacy payloads from before findings-parsing landed, or payloads
+		from a previous session).
+		"""
+		side = meta_dict.get("sidecar_meta") or {}
+		# Sidecar wins when present — it carries the actual confidence and
+		# gadget_hit signal that smuggler computed at write time.
+		if side:
+			conf = (side.get("confidence") or "").lower()
+			if side.get("gadget_hit") or conf == "confirmed":
+				return side.get("kind") or meta_dict.get("scan_type", "?"), "confirmed"
+			if conf == "potential":
+				return side.get("kind") or meta_dict.get("scan_type", "?"), "potential"
+		# No sidecar — infer from the ptype segment encoded in the
+		# filename. Advanced scanners only write a payload when their
+		# intrinsic oracle fires, so those are "confirmed" by default.
+		# Classic CLTE/TECL writes payloads in both confirmed and potential
+		# cases — without a sidecar we can't tell, so default to potential.
+		scan_raw = (meta_dict.get("scan_type") or "?").upper()
+		confirmed_prefixes = {
+			"CL0": "CL.0", "TE0": "TE.0", "PAUSE": "Pause",
+			"CONNSTATE": "ConnState", "PARSERDISC": "ParserDisc",
+			"HOPBYHOP": "HopByHop", "BARECHUNK": "BareLF",
+		}
+		potential_prefixes = {
+			"HDRREMOVAL": "HdrRemoval", "EXPECT": "Expect",
+		}
+		for pref, label in confirmed_prefixes.items():
+			if scan_raw.startswith(pref):
+				return label, "confirmed"
+		for pref, label in potential_prefixes.items():
+			if scan_raw.startswith(pref):
+				return label, "potential"
+		if scan_raw in ("CLTE", "TECL"):
+			return scan_raw, "potential"  # unknown without sidecar
+		return scan_raw or "?", "potential"
+
+	def backfill_findings_from_disk() -> None:
+		"""Create Finding objects from every payload already in payloads/.
+
+		Useful when:
+		- The findings parser was broken (e.g. before the page_client fix
+		  landed) and a previous run's payloads exist on disk with no
+		  matching panel entries.
+		- You're resuming a session and want to see prior findings.
+
+		Dedupes by payload filename so clicking twice is a no-op.
+		"""
+		try:
+			files = sorted(PAYLOADS_DIR.glob("*.txt"),
+				key=lambda p: p.stat().st_mtime, reverse=True)
+		except OSError:
+			files = []
+		existing = {f.payload_name for f in findings if f.payload_name}
+		added = 0
+		for p in files:
+			if p.name in existing:
+				continue
+			meta_dict = _parse_payload_meta(p)
+			side = meta_dict.get("sidecar_meta") or {}
+			scan, confidence = _classify_payload_for_backfill(meta_dict)
+			host = meta_dict.get("host") or "?"
+			# Prefer the URL recorded in the sidecar (full path) over the
+			# scheme+host we can derive from the filename.
+			url = side.get("url") or f"{meta_dict['scheme']}://{host}"
+			if side:
+				conf_word = "CONFIRMED" if (
+					side.get("gadget_hit")
+					or (side.get("confidence") or "").lower() == "confirmed"
+				) else "Potential"
+				gadget = " [gadget=/robots.txt]" if side.get("gadget_hit") else ""
+				method = side.get("method", "POST")
+				cfg_name = side.get("configfile", "?")
+				line = (f"{conf_word} {scan} Issue Found - {method} @ {url} - "
+					f"{cfg_name}{gadget}  (backfilled from sidecar)")
+			else:
+				line = (f"{scan} payload on disk — confidence inferred from "
+					f"filename (no sidecar; re-run scan for full data)")
+			findings.append(Finding(
+				id=uuid.uuid4().hex[:8],
+				ts=p.stat().st_mtime,
+				confidence=confidence,
+				scan=_norm_label(scan),
+				line=line,
+				url=url,
+				payload_path=str(p),
+				payload_name=p.name,
+			))
+			added += 1
+		# Newest first so the most recent payloads appear at the top.
+		findings.sort(key=lambda x: x.ts, reverse=True)
+		rerender_findings()
+		if added:
+			ui.notify(f"Backfilled {added} finding(s) from payloads/",
+				type="positive")
+		else:
+			ui.notify("No new findings to backfill — payloads/ is empty "
+				"or every payload is already in the panel.", type="info")
+
 	def _export_findings_md() -> None:
 		if not findings:
 			ui.notify("No findings to export yet.", type="warning")
@@ -1663,6 +1979,16 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 
 	refresh_payloads(force=True)
 	rerender_findings()
+	# Auto-backfill the Findings panel once on page load so a user who
+	# opens the GUI and already has files in payloads/ (from a previous
+	# session, or from a run before parsing was working) sees them
+	# immediately without having to click anything.
+	if not findings:
+		try:
+			if any(PAYLOADS_DIR.glob("*.txt")):
+				backfill_findings_from_disk()
+		except OSError:
+			pass
 
 
 def resolve_request_files_dry(cfg: RunConfig) -> tuple[Optional[str], Optional[str]]:
