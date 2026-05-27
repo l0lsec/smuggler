@@ -31,6 +31,43 @@ This tool does not guarantee no false-positives or false-negatives. Just because
 2) cd smuggler
 3) python3 smuggler.py -h
 
+## Web GUI (optional)
+
+Smuggler ships with a NiceGUI-based web frontend that exposes every CLI flag
+as a form control, streams colorized output to the browser in real time, and
+gives you a stop button plus a payloads browser. The GUI is a thin wrapper
+around `smuggler.py` (it spawns the CLI as a subprocess) so behavior is
+identical and no functionality is hidden.
+
+```
+pip install -r requirements.txt      # installs nicegui
+python3 webgui.py                     # serves on http://127.0.0.1:8765
+```
+
+By default the server binds to `127.0.0.1` only. Do NOT expose it on a
+public interface -- it is a remote-scan launcher. Pass `--public` only if
+you understand the risk.
+
+Features:
+
+- Three target modes: single URL, list of hosts (piped via stdin), or
+  request file (upload, path, or inline-paste editor).
+- All flags surfaced: `-v/--vhost`, `-m/--method`, `-t/--timeout`,
+  `-c/--configfile` (auto-populated from `configs/*.py`),
+  `--proxy`, `--cookies`, `--persistent-connection`, `--http2`,
+  `--scan-type` (multiselect), `--pause-timeout`, `-x/--exit_early`,
+  `-q/--quiet`, `--no-color`, `-l/--log`.
+- Replay mode (`--replay`) with optional baseline request file
+  (`--baseline-request`) for differential comparison.
+- Live counters (Total / Success / Failed / Timeout / Error / RPS / latest
+  request ID) parsed from the existing `[REPLAY]` status line.
+- Stop button sends `SIGINT` (which `ReplayManager` already treats as a
+  clean shutdown), then escalates to `SIGTERM` and `SIGKILL`.
+- "Copy command" button surfaces the exact `python3 smuggler.py ...`
+  invocation so you can paste it into a shell.
+- `payloads/` browser with download links for any files produced by a
+  CRITICAL finding.
+
 ## Example Usage
 
 Single Host:

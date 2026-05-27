@@ -156,3 +156,6 @@ tests/req3.txt
 tests/req1.txt
 tests/req2.txt
 tests/baseline_test.txt
+
+# Web GUI scratch / temp uploaded request files
+tmp/webgui/

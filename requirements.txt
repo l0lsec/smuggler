@@ -3,5 +3,8 @@
 # Optional: HTTP/2 support (required for --http2 and --scan-type h2)
 h2>=4.0.0
 
+# Optional: Web GUI (run `python3 webgui.py` to launch)
+nicegui>=2.0
+
 # Test-only
 pytest>=7.0; python_version >= "3.7"
