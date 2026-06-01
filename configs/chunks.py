@@ -1,3 +1,7 @@
+# Small, high-signal set of classic Transfer-Encoding mutations for the
+# TE.CL / CL.TE scan: the handful that catch the most common real-world
+# parser disagreements (dual TE, comma-lists, CR/LF header-setup tricks).
+# The fastest config; use it for a quick smoke test before a deeper sweep.
 
 def render_template(gadget):
 	RN = "\r\n"

@@ -1212,6 +1212,27 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 				log_box = ui.html("", sanitize=False).classes("smug-log w-full")
 				log_view["html"] = log_box
 
+			# --- Confirm finding (single connection) -----
+			with ui.card().classes("w-full"):
+				with ui.row().classes("w-full items-center justify-between"):
+					ui.label("Confirm finding (single connection)") \
+						.classes("text-base font-semibold")
+					ui.button("Refresh", icon="refresh",
+						on_click=lambda: refresh_payloads(force=True)).props("flat dense")
+				ui.label("Replays a finding from payloads/ on one connection "
+					"using only your own requests — like sending the pair in "
+					"Burp Repeater. No third-party traffic is captured.") \
+					.classes("text-xs text-gray-500")
+				confirm_select = ui.select({}, label="Finding to confirm") \
+					.classes("w-full").props("dense outlined")
+				confirm_followup = ui.textarea(
+					label="Optional: your own follow-up request "
+						"(prefix/pause modes; a canary GET is used if blank)") \
+					.classes("w-full").props("outlined autogrow")
+				with ui.row().classes("gap-2 items-center"):
+					confirm_btn = ui.button("Run confirmation", icon="verified",
+						on_click=lambda: on_confirm())
+
 			# --- Payloads browser -----
 			with ui.card().classes("w-full"):
 				with ui.row().classes("w-full items-center justify-between"):
@@ -1396,6 +1417,54 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 			payload_state["known"] = set()
 		payload_state["last_signature"] = None
 		refresh_payloads()
+
+		state.task = asyncio.create_task(stream_process(
+			cfg, argv, push_log, push_status, on_exit, state,
+		))
+
+	async def on_confirm() -> None:
+		if state.is_running():
+			ui.notify("A run is already in progress.", type="warning")
+			return
+		payload = confirm_select.value
+		if not payload:
+			ui.notify("Pick a finding to confirm.", type="negative")
+			return
+
+		argv = [sys.executable, "-u", str(SMUGGLER_PY),
+			"--confirm", "--confirm-payload", str(payload)]
+		# Carry over the connection-relevant flags from the main form so the
+		# confirmer reaches the same target through the same proxy.
+		if cfg.url.strip():
+			argv += ["-u", cfg.url.strip()]
+		if cfg.vhost.strip():
+			argv += ["-v", cfg.vhost.strip()]
+		try:
+			t = float(cfg.timeout)
+			if t and t != 5.0:
+				argv += ["-t", str(t)]
+		except (TypeError, ValueError):
+			pass
+		if cfg.proxy.strip():
+			argv += ["--proxy", cfg.proxy.strip()]
+		if cfg.cookies.strip():
+			argv += ["--cookies", cfg.cookies]
+		followup = (confirm_followup.value or "").strip()
+		if followup:
+			argv += ["--confirm-followup", _write_tmp_request("confirm-followup", followup)]
+
+		clear_log()
+		push_log(f"\x1B[36m$ {' '.join(shlex.quote(a) for a in argv)}\x1B[0m\n")
+		status_label.set_text("Confirming...")
+		start_btn.set_visibility(False)
+		stop_btn.set_visibility(True)
+		replay_card.set_visibility(False)
+		payload_state["new"] = set()
+		try:
+			payload_state["known"] = {p.name for p in PAYLOADS_DIR.glob("*.txt")}
+		except OSError:
+			payload_state["known"] = set()
+		payload_state["last_signature"] = None
 
 		state.task = asyncio.create_task(stream_process(
 			cfg, argv, push_log, push_status, on_exit, state,
@@ -1926,6 +1995,19 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 		if (not force) and signature == payload_state["last_signature"]:
 			return
 		payload_state["last_signature"] = signature
+
+		# Keep the "Confirm finding" dropdown in sync with what's on disk.
+		try:
+			confirm_opts = {}
+			for p in files:
+				if p.name.endswith(".response.txt"):
+					continue
+				m = _parse_payload_meta(p)
+				kind = (m.get("sidecar_meta") or {}).get("kind") or m.get("scan_type") or "?"
+				confirm_opts[str(p)] = f"{p.name}  ·  {kind}"
+			confirm_select.set_options(confirm_opts)
+		except (OSError, NameError):
+			pass
 
 		payloads_box.clear()
 		if not files:

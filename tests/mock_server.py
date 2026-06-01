@@ -22,6 +22,9 @@ Behaviors:
   header_removal_fp    - returns 200 + canary in both responses, but the
                          response with Keep-Alive has an extra X-Edge header
                          and a longer body (fingerprint-only divergence)
+  connstate            - first request on a connection -> 200, every reused
+                         request on the same connection -> 403 (models a
+                         connection-state / first-request-routing diff)
 """
 
 import socketserver
@@ -313,6 +316,29 @@ class _Handler(socketserver.BaseRequestHandler):
 							b"Connection: keep-alive\r\n"
 							b"\r\n" % len(resp_body)
 						) + resp_body
+						conn.sendall(resp)
+
+				elif behavior == "connstate":
+					# First request on a connection is routed normally (200);
+					# every subsequent request reused on the SAME connection
+					# is treated as stale and rejected (403). This models a
+					# first-request-routing / connection-state discrepancy:
+					# the response a request gets depends on whether it's the
+					# first on its connection. self is the per-connection
+					# handler instance, so the counter persists across the
+					# pipeline loop but resets for a fresh connection.
+					self._cs_count = getattr(self, "_cs_count", 0) + 1
+					if self._cs_count == 1:
+						conn.sendall(DEFAULT_RESPONSE)
+					else:
+						stale_body = b"stale connection state\n"
+						resp = (
+							b"HTTP/1.1 403 Forbidden\r\n"
+							b"Content-Type: text/plain\r\n"
+							b"Content-Length: %d\r\n"
+							b"Connection: keep-alive\r\n"
+							b"\r\n" % len(stale_body)
+						) + stale_body
 						conn.sendall(resp)
 
 				else:

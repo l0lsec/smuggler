@@ -1,3 +1,7 @@
+# Balanced default config for the TE.CL / CL.TE scan (~152 mutations):
+# Transfer-Encoding header-name/value obfuscation, a curated set of control
+# bytes around the header, and request-line whitespace abuse. Good
+# general-purpose first pass; escalate to exhaustive.py / doubles.py for depth.
 
 def render_template(gadget):
 	RN = "\r\n"

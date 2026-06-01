@@ -1,3 +1,8 @@
+# NOTE: despite the filename, this config does NOT test HTTP/2. It is a small
+# curated set of classic HTTP/1.1 Transfer-Encoding mutations (a subset of
+# chunks.py) used by the TE.CL / CL.TE scan. For real HTTP/2 downgrade
+# smuggling use `--http2` / `--scan-type h2`, which is handled by the dedicated
+# scanner in lib/H2Scans.py and ignores `-c/--configfile`.
 
 def render_template(gadget):
 	RN = "\r\n"

@@ -212,9 +212,71 @@ Use --cookies \<cookies> to specify custom cookies that will be included in all 
 ### Persistent Connections
 Use --persistent-connection to use a single TCP connection for all requests instead of creating new connections for each test. This can improve performance and better simulate real-world scenarios.
 
-## Config Files
-Configuration files are python files that exist in the ./config directory of smuggler. These files describe the content of the HTTP requests and the transfer-encoding mutations to test.
+### Self-Contained Desync Confirmation
+After a scan writes a finding to `payloads/`, use `--confirm` to reproduce that finding on a **single connection using only your own requests** — much like sending a request pair in Burp Repeater. It never waits for, reads, or stores any third party's traffic; the goal is to reliably re-trigger the desync against your own follow-up so the finding can be shown in a report.
 
+```bash
+# Interactive: pick a finding from payloads/ and confirm it
+python3 smuggler.py --confirm
+
+# Non-interactive: confirm a specific finding (target is read from the
+# payload's .meta.json, or pass -u to override)
+python3 smuggler.py --confirm --confirm-payload payloads/https_example_com_CL0_x.txt
+
+# Supply your own follow-up request instead of the synthesized canary GET
+python3 smuggler.py --confirm --confirm-payload payloads/...CL0_x.txt --confirm-followup my_followup.txt
+```
+
+Flags:
+- `--confirm` — enter confirmation mode. Without `--confirm-payload`, it lists the findings in `payloads/` and prompts you to pick one (skipped in `--quiet`, which then requires `--confirm-payload`).
+- `--confirm-payload <file>` — the `payloads/*.txt` finding to confirm.
+- `--confirm-followup <file>` — your own follow-up request (used by the prefix and pause modes). If omitted, a benign canary `GET` to the target is synthesized. The follow-up must target the same host or confirmation is refused.
+
+The confirmer routes each finding to the appropriate mode based on its kind (read from the `.meta.json` sidecar, falling back to the filename tag and content markers):
+
+| Finding kind | Mode | Honors `--confirm-followup` |
+| --- | --- | --- |
+| `CLTE`, `TECL`, `CL0`, `TE0`, `EXPECT`, `BARELF`, parser-discrepancy | prefix-pipeline | yes |
+| `HDRREMOVAL`, `HDRREMOVAL_FP`, `HOPBYHOP*` | differential (request with vs without the trigger header) | no (derives its own twin) |
+| `CONNSTATE`, `CONNSTATE_FP`, `CONNSTATE-REFLECT` | connection-state (reused vs fresh connection) | no |
+| `PAUSE` | timed/pause (headers, pause, prefix) | yes |
+| `H2_*` | HTTP/2 downgrade (re-drives the probe over HTTP/2) | no |
+
+Each run writes a `0600` evidence artifact to `payloads/confirmations/<scheme>_<host>_<port>_<kind>_<utc-timestamp>.txt` containing the exact bytes you sent and the responses they produced, plus a `CONFIRMED` / `NOT CONFIRMED` verdict. The process exits `0` when confirmed, `1` when not, and `2` on a refusal/setup error.
+
+Notes and limits:
+- Every mode sends only your own requests. Nothing waits for or captures another user's request, cookies, auth, or CSRF tokens.
+- It only ever replays vectors Smuggler already detected and wrote to `payloads/`; it does not craft new attacks from free text.
+- HTTP/2 confirmation requires the `h2` library and a target that negotiates HTTP/2 over ALPN; otherwise it reports `NOT CONFIRMED` with a clear reason rather than failing.
+- In the Web GUI, the **Confirm finding (single connection)** card lets you pick a finding, optionally paste your own follow-up, and stream the result into the output log; evidence appears in the payloads browser.
+
+## Config Files
+Configuration files are Python files in the `./configs` directory. Each one is `exec()`'d by Smuggler with a `Payload` class and a `mutations` dict in scope, and populates `mutations[name] = Payload(...)`. Every entry is one variant of the same request whose framing headers are deliberately mangled to provoke a front-end/back-end parser disagreement. Placeholders (`__METHOD__`, `__ENDPOINT__`, `__HOST__`, `__RANDOM__`, `__REPLACE_CL__`) are substituted at send time.
+
+> Scope: config files only drive the **classic `TE.CL` / `CL.TE` scan** (`--scan-type tecl,clte`, the default). The advanced scanners (`cl0`, `pause`, `connection-state`, `parser-discrepancy`, `header-removal`, `expect`, `te0`, `bare-lf`, `hop-by-hop`, `h2`) synthesize their own payloads and **ignore `-c/--configfile`**.
+
+> Security: configs are arbitrary Python run with full process privileges. Only load configs you trust.
+
+### Which config to use
+
+Select with `-c/--configfile <name>` (default: `default.py`). The bundled configs:
+
+| Config | Mutations | Focus | Speed | Use when |
+| --- | --- | --- | --- | --- |
+| `chunks.py` | 15 | Curated, high-signal `Transfer-Encoding` tricks (dual TE, comma-lists, CR/LF header-setup) | Fastest | Quick smoke test of a target before a deeper sweep |
+| `default.py` | 152 | Balanced TE header obfuscation (name/value whitespace + a curated control-byte set) plus request-line whitespace abuse | Fast | General-purpose first pass (the default) |
+| `cl_mutations.py` | 18 | `Content-Length` obfuscation (signed, padded, decimal, duplicate CL, `Expect: 100-continue`) paired with TE | Fast | You suspect the **Content-Length** parser is the weak point (CL.TE where the CL itself is the trick) |
+| `chunkext.py` | 17 | Chunk extensions + parameterized/listed TE values (`chunked;a=b`, `q=` weights, comma TE lists) | Fast | You suspect TE **value** parsing discrepancies |
+| `http10.py` | 8 | HTTP/1.0 + `Connection: keep-alive` desync (TE over 1.0, `Proxy-Connection`, dual TE) | Fast | The target or an upstream hop speaks/downgrades to HTTP/1.0 |
+| `exhaustive.py` | 714 | Broad single-byte sweep across the full `0x01`–`0xFF` range, many named tricks, request-line and HTTP/1.0 variants | Slow | `default.py` found nothing and you want maximum single-byte coverage |
+| `doubles.py` | 966 | Exhaustive **byte-pair** fuzz: every control/high byte in two positions around the TE header | Very slow | Last-resort deep sweep against a stubborn target |
+| `h2.py` | 10 | A small reduced TE set (subset of `chunks.py`) — **does not test HTTP/2** | Fastest | Rarely needed; prefer `chunks.py`. See note below |
+
+Note on `h2.py`: despite the name it contains classic HTTP/1.1 `Transfer-Encoding` mutations, not HTTP/2 payloads. To actually test HTTP/2 downgrade smuggling, use `--http2` (or `--scan-type h2`), which is handled by the dedicated HTTP/2 scanner (`lib/H2Scans.py`), not by any `-c` config.
+
+Rule of thumb: start with `default.py`; drop to `chunks.py` for a fast check; escalate to `exhaustive.py` then `doubles.py` when you need depth; reach for `cl_mutations.py` / `chunkext.py` / `http10.py` when you have a specific hypothesis about which parser misbehaves.
+
+There are no command-line arguments yet for custom headers/user-agents. To customize, copy `default.py` and edit it to taste.
 
 Here is example content of default.py:
 ```python
@@ -248,13 +310,6 @@ for i in [0x1,0x4,0x8,0x9,0xa,0xb,0xc,0xd,0x1F,0x20,0x7f,0xA0,0xFF]:
 	mutations["endspacerx-%02x"%i] = render_template("Transfer-Encoding: chunked\r%cX: X"%(i))
 	mutations["endspacexn-%02x"%i] = render_template("Transfer-Encoding: chunked%c\nX: X"%(i))
 ```
-
-There are no input arguments yet on specifying your own customer headers and user-agents. It is recommended to create your own configuration file based on default.py and modify it to your liking.
-
-Smuggler comes with 3 configuration files: default.py (fast), doubles.py (niche, slow), exhaustive.py (very slow)
-default.py is the fastest because it contains less mutations.
-
-specify configuration files using the -c/--configfile \<configfile> command line option
 
 ## Payloads Directory
 Inside the Smuggler directory is the payloads directory. When Smuggler finds a potential CLTE or TECL desync issue, it will automatically dump a binary txt file of the problematic payload in the payloads directory. All payload filenames are annotated with the hostname, desync type and mutation type. Use these payloads to netcat directly to the server or to import into other analysis tools.

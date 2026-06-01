@@ -1,3 +1,7 @@
+# Exhaustive byte-PAIR fuzz for the TE.CL / CL.TE scan (~966 mutations):
+# every control byte (0x01-0x20) and high byte (0x7F-0xFF) injected in two
+# positions around the Transfer-Encoding header at once. Very slow and niche;
+# use only as a last-resort deep sweep against a stubborn target.
 
 def render_template(gadget):
 	RN = "\r\n"

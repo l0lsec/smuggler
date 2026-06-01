@@ -44,6 +44,8 @@ from lib.Scans import (
 )
 from lib.Oracle import GadgetOracle
 from lib.Fingerprint import Fingerprint, baseline_fingerprint, split_pipelined_responses
+from lib.RequestFile import parse_request_file, RequestFileError
+from lib.Confirm import DesyncConfirmer, ConfirmError, family_for_kind, _repo_payloads_dir
 from lib.Timing import TimingBaseline
 from urllib.parse import urlparse
 
@@ -1214,69 +1216,6 @@ class ReplayManager():
 			print_info("Last Request      : %s" % (Fore.CYAN + self.stats['last_request_time'].strftime("%Y-%m-%d %H:%M:%S")))
 		print_info("=" * 60)
 
-def parse_request_file(filepath):
-	"""Parse an HTTP request from a file and return its components"""
-	try:
-		with open(filepath, 'r') as f:
-			content = f.read()
-		
-		# Split headers and body
-		parts = content.split('\r\n\r\n', 1)
-		if len(parts) == 1:
-			# Try with just \n\n
-			parts = content.split('\n\n', 1)
-		
-		headers_section = parts[0]
-		body = parts[1] if len(parts) > 1 else ""
-		
-		# Parse request line
-		lines = headers_section.split('\n')
-		request_line = lines[0].strip()
-		request_parts = request_line.split(' ')
-		
-		if len(request_parts) < 3:
-			raise ValueError("Invalid request line format")
-		
-		method = request_parts[0]
-		endpoint = request_parts[1]
-		
-		# Parse headers to find Host and Cookie
-		host = None
-		cookies = []
-		for line in lines[1:]:
-			line_stripped = line.strip()
-			if line_stripped.lower().startswith('host:'):
-				host = line_stripped.split(':', 1)[1].strip()
-			elif line_stripped.lower().startswith('cookie:'):
-				# Extract cookie value
-				cookie_value = line_stripped.split(':', 1)[1].strip()
-				# The cookie value might already have semicolons, parse them
-				if cookie_value:
-					# Split by semicolon and clean up
-					cookie_parts = [c.strip() for c in cookie_value.split(';') if c.strip()]
-					for cookie in cookie_parts:
-						if cookie and not cookie.endswith(';'):
-							cookies.append(cookie + ';')
-						elif cookie:
-							cookies.append(cookie)
-		
-		return {
-			'method': method,
-			'endpoint': endpoint,
-			'host': host,
-			'cookies': cookies,
-			'headers': headers_section,
-			'body': body,
-			'raw': content
-		}
-	except FileNotFoundError:
-		print_info("Error: Request file not found: %s" % (Fore.CYAN + filepath))
-		exit(1)
-	except Exception as e:
-		print_info("Error parsing request file: %s" % (Fore.CYAN + str(e)))
-		exit(1)
-
-
 def warn_if_request_unsafe_for_scan_mode(parsed, filepath):
 	"""Emit warnings when a -r/--request file looks like a smuggling POC.
 
@@ -1347,6 +1286,114 @@ def warn_if_request_unsafe_for_scan_mode(parsed, filepath):
 	for w in warnings:
 		print_info("        - " + Fore.YELLOW + w)
 	print_info("        Use " + Fore.CYAN + "--replay" + Fore.MAGENTA + " to send the request verbatim, or " + Fore.CYAN + "--baseline-request" + Fore.MAGENTA + " for a control sample.")
+
+
+def _confirm_payload_kind(payload_path):
+	"""Best-effort kind label for a payload file, for the picker display."""
+	base = payload_path[:-4] if payload_path.endswith(".txt") else payload_path
+	try:
+		import json as _json
+		meta = _json.loads(open(base + ".meta.json", encoding="utf-8").read())
+		if meta.get("kind"):
+			return meta["kind"]
+	except (OSError, ValueError):
+		pass
+	stem = os.path.basename(base).split("_")
+	return stem[-2] if len(stem) >= 3 else "?"
+
+
+def _derive_confirm_target(payload_path, args):
+	"""Resolve (host, port, endpoint, ssl_flag, method) for a confirmation
+	run, preferring the payload's .meta.json url, then -u/--url."""
+	base = payload_path[:-4] if payload_path.endswith(".txt") else payload_path
+	url = None
+	method = "POST"
+	try:
+		import json as _json
+		meta = _json.loads(open(base + ".meta.json", encoding="utf-8").read())
+		url = meta.get("url")
+		method = meta.get("method") or method
+	except (OSError, ValueError):
+		pass
+	if not url:
+		url = args.url
+	if not url:
+		return None
+	host, port, endpoint, ssl_flag = process_uri(url)
+	return host, port, endpoint, ssl_flag, method
+
+
+def run_confirmation(args):
+	"""Drive a single self-contained confirmation. Returns a process exit
+	code: 0 = CONFIRMED, 1 = NOT CONFIRMED, 2 = refused / setup error."""
+	payloads_dir = _repo_payloads_dir()
+	payload = args.confirm_payload
+
+	if not payload:
+		if args.quiet:
+			print_info("Error: --confirm in --quiet mode requires --confirm-payload")
+			return 2
+		import glob
+		candidates = sorted(
+			f for f in glob.glob(os.path.join(payloads_dir, "*.txt"))
+			if not f.endswith(".response.txt"))
+		if not candidates:
+			print_info("No payload files found in %s -- run a scan first." % (Fore.CYAN + payloads_dir))
+			return 2
+		print_info("Select a finding to confirm:")
+		for i, f in enumerate(candidates):
+			print_info("  [%d] %s (%s)" % (
+				i, Fore.CYAN + os.path.basename(f) + Fore.MAGENTA,
+				Fore.YELLOW + _confirm_payload_kind(f)))
+		try:
+			choice = input("Pick a finding number (or blank to cancel): ").strip()
+		except (EOFError, KeyboardInterrupt):
+			print_info("\nConfirmation cancelled.")
+			return 2
+		if not choice:
+			print_info("Confirmation cancelled.")
+			return 2
+		try:
+			payload = candidates[int(choice)]
+		except (ValueError, IndexError):
+			print_info("Invalid selection.")
+			return 2
+
+	target = _derive_confirm_target(payload, args)
+	if not target:
+		print_info("Error: cannot determine target. The payload has no .meta.json url; pass -u/--url.")
+		return 2
+	host, port, endpoint, ssl_flag, method = target
+
+	cookies = ""
+	if args.cookies:
+		cookies = args.cookies
+
+	print_info("Confirming  : %s" % (Fore.CYAN + os.path.basename(payload)))
+	print_info("Target      : %s://%s:%d" % ("https" if ssl_flag else "http", host, port))
+	print_info("Mode        : %s" % (Fore.CYAN + family_for_kind(_confirm_payload_kind(payload))))
+	print_info("Note        : single-connection, your own requests only; no third-party traffic is captured.")
+
+	confirmer = DesyncConfirmer(
+		host, port, ssl_flag, float(args.timeout), proxy=args.proxy,
+		vhost=args.vhost, cookies=cookies, method=method, endpoint=endpoint,
+		payloads_dir=payloads_dir)
+	try:
+		ok = confirmer.confirm(payload, followup_path=args.confirm_followup)
+	except ConfirmError as e:
+		print_info("Confirmation refused: %s" % (Fore.YELLOW + str(e)))
+		return 2
+	except Exception as e:
+		print_info("Confirmation error: %s" % (Fore.RED + str(e)))
+		return 2
+
+	colour = Fore.GREEN if ok else Fore.YELLOW
+	print_info(colour + confirmer.summarize())
+	evidence = getattr(confirmer, "_evidence_path", None)
+	if evidence:
+		print_info("Evidence    : %s" % (Fore.CYAN + evidence))
+	return 0 if ok else 1
+
 
 def process_uri(uri):
 	u = urlparse(uri)
@@ -1430,6 +1477,9 @@ if __name__ == "__main__":
 	Parser.add_argument('--scan-type', default="tecl,clte", help="Comma-separated scan types: tecl,clte,cl0,pause,connection-state,parser-discrepancy,header-removal,expect,te0,bare-lf,hop-by-hop,h2,all (default: tecl,clte)")
 	Parser.add_argument('--http2', action='store_true', help="Enable HTTP/2 downgrade scans")
 	Parser.add_argument('--pause-timeout', type=int, default=61, help="Timeout in seconds for pause-based desync (default: 61)")
+	Parser.add_argument('--confirm', action='store_true', help="Self-contained confirmation: replay a finding from payloads/ on a single connection using only your own requests (no third-party traffic)")
+	Parser.add_argument('--confirm-payload', help="Path to the payloads/*.txt finding to confirm (skips the interactive picker)")
+	Parser.add_argument('--confirm-followup', help="Optional file with your own follow-up request (prefix/pause modes); a benign canary GET is synthesized if omitted")
 	Args = Parser.parse_args()  # returns data from the options specified (echo)
 
 	NOCOLOR = Args.no_color
@@ -1446,7 +1496,11 @@ if __name__ == "__main__":
 	# Parse request file if provided
 	custom_request = None
 	if Args.request:
-		custom_request = parse_request_file(Args.request)
+		try:
+			custom_request = parse_request_file(Args.request)
+		except RequestFileError as e:
+			print_info("Error: %s" % (Fore.CYAN + str(e)))
+			exit(1)
 		print_info("Request File: %s"%(Fore.CYAN + Args.request))
 		# In scan mode the request file is only a template for
 		# method/endpoint/host/cookies -- warn the user if their file
@@ -1458,7 +1512,11 @@ if __name__ == "__main__":
 	# Parse baseline request file if provided
 	baseline_request = None
 	if Args.baseline_request:
-		baseline_request = parse_request_file(Args.baseline_request)
+		try:
+			baseline_request = parse_request_file(Args.baseline_request)
+		except RequestFileError as e:
+			print_info("Error: %s" % (Fore.CYAN + str(e)))
+			exit(1)
 		print_info("Baseline Request File: %s"%(Fore.CYAN + Args.baseline_request))
 		# Baseline is always sent verbatim alongside the smuggle request
 		# for comparison -- if THIS one looks POC-shaped the comparison is
@@ -1512,7 +1570,13 @@ if __name__ == "__main__":
 		if FileHandle is not None:
 			FileHandle.close()
 		exit(0)
-	
+
+	# Self-contained confirmation mode. Handled before the scan-target
+	# requirement because it derives its target from the chosen payload's
+	# sidecar metadata (falling back to -u). Replays only our own requests.
+	if Args.confirm:
+		exit(run_confirmation(Args))
+
 	# If the URL argument is not specified then check stdin or request file
 	if Args.url is None and Args.request is None:
 		if sys.stdin.isatty():

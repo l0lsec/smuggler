@@ -160,3 +160,4 @@ tests/baseline_test.txt
 # Web GUI scratch / temp uploaded request files
 tmp/webgui/
 archive/
+*.plan.md
