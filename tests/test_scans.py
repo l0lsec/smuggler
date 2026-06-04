@@ -17,6 +17,7 @@ import pytest
 import tests.mock_server as mock_server
 from lib.Scans import (
 	ScanCL0, ScanHeaderRemoval, ScanParserDiscrepancy, ScanHopByHop,
+	_inject_extra_headers, _build_raw_request,
 )
 
 
@@ -205,3 +206,57 @@ def test_scan_header_removal_fp_only_detection(server_factory):
 	assert found is True
 	assert any(ptype == "HDRREMOVAL_FP" for _h, ptype, _p in writes), \
 		"expected HDRREMOVAL_FP payload, got: %r" % [t for _h, t, _p in writes]
+
+
+# ----- Custom-header injection -------------------------------------------
+
+def test_inject_extra_headers_appends_and_dedups():
+	# A request whose hardcoded block already has a User-Agent; the custom
+	# User-Agent must replace it (no duplicate) while Authorization is added.
+	raw = (
+		"POST /x HTTP/1.1\r\n"
+		"Host: h\r\n"
+		"User-Agent: scanner-default\r\n"
+		"Content-Length: 3\r\n"
+		"\r\n"
+		"abc"
+	)
+	out = _inject_extra_headers(raw, [
+		"Authorization: Bearer tok",
+		"User-Agent: my-agent",
+	])
+	# Custom values present.
+	assert "Authorization: Bearer tok\r\n" in out
+	assert "User-Agent: my-agent\r\n" in out
+	# Hardcoded default removed -> exactly one User-Agent line.
+	assert out.count("User-Agent:") == 1
+	assert "scanner-default" not in out
+	# Body and framing preserved untouched.
+	assert out.endswith("\r\n\r\nabc")
+	assert "Content-Length: 3\r\n" in out
+
+
+def test_inject_extra_headers_noop_when_empty():
+	raw = "GET / HTTP/1.1\r\nHost: h\r\n\r\n"
+	assert _inject_extra_headers(raw, []) == raw
+	assert _inject_extra_headers(raw, None) == raw
+
+
+def test_build_raw_request_carries_extra_headers():
+	req = _build_raw_request("GET", "/", "h",
+		extra_headers=["Authorization: Bearer tok", "X-Dtc: v=1"])
+	assert "Authorization: Bearer tok\r\n" in req
+	assert "X-Dtc: v=1\r\n" in req
+
+
+def test_scan_cl0_attack_carries_authorization():
+	# The CL.0 attack request must carry the pasted Authorization header
+	# exactly once, positioned before the framing Content-Length line.
+	scanner = ScanCL0(**_common_kwargs(0),
+		extra_headers=["Authorization: Bearer tok"])
+	gadget = {"path": "/robots.txt", "look_for": "llow:", "header_only": False}
+	req = scanner._build_cl0_attack("GET", gadget, cookie_hdr="")
+	assert req.count("Authorization: Bearer tok") == 1
+	# Must live in the header block, not leak into the smuggled body prefix.
+	head = req.split("\r\n\r\n", 1)[0]
+	assert "Authorization: Bearer tok" in head

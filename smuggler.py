@@ -73,6 +73,7 @@ class Desyncr():
 		self._quiet = quiet
 		self._exit_early = exit_early
 		self._cookies = []
+		self._headers = []
 		self._proxy = proxy
 		self._custom_request = custom_request
 		self._persistent_connection = persistent_connection
@@ -82,6 +83,11 @@ class Desyncr():
 			self._cookies.extend(custom_request['cookies'])
 			info = ((Fore.CYAN + str(len(custom_request['cookies']))+ Fore.MAGENTA), self._logh)
 			print_info("Cookies from request file: %s" % (info[0]))
+
+		if custom_request and custom_request.get('extra_headers'):
+			self._headers.extend(custom_request['extra_headers'])
+			info = ((Fore.CYAN + str(len(custom_request['extra_headers']))+ Fore.MAGENTA), self._logh)
+			print_info("Headers from request file: %s" % (info[0]))
 
 		if cookies_str:
 			self._parse_custom_cookies(cookies_str)
@@ -123,6 +129,26 @@ class Desyncr():
 		except Exception as e:
 			error = ((Fore.CYAN + "Error parsing cookies: " + str(e) + Fore.MAGENTA), self._logh)
 			print_info("Error      : %s" % (error[0]))
+
+	def _apply_extra_headers(self, header_str):
+		"""Append the custom request headers (Authorization, X-Dtc, ...) to a
+		CRLF header block. Any existing line whose header name collides with a
+		custom header is dropped first so the user's value wins -- this avoids a
+		duplicate User-Agent/Content-Type when the pasted request supplied one.
+		Lines without a colon (e.g. the request line) are always preserved."""
+		if not self._headers:
+			return header_str
+		custom_names = {h.split(':', 1)[0].strip().lower() for h in self._headers}
+		kept = []
+		for line in header_str.split("\r\n"):
+			if ':' in line and line.split(':', 1)[0].strip().lower() in custom_names:
+				continue
+			kept.append(line)
+		header_str = "\r\n".join(kept)
+		if header_str and not header_str.endswith("\r\n"):
+			header_str += "\r\n"
+		header_str += ''.join(h + "\r\n" for h in self._headers)
+		return header_str
 
 	def _establish_persistent_connection(self):
 		"""Establish a persistent connection if enabled"""
@@ -223,6 +249,7 @@ class Desyncr():
 			p.header += "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/78.0.3904.87 Safari/537.36" + RN
 			p.header += "Content-type: application/x-www-form-urlencoded; charset=UTF-8" + RN
 			p.header += "Content-Length: 0" + RN
+			p.header = self._apply_extra_headers(p.header)
 			p.body = ""
 			#print (str(p))
 			web.send(str(p).encode())
@@ -372,7 +399,8 @@ class Desyncr():
 					scanner = ScanH2Desync(
 						self._host, self._port, self.ssl_flag, self._timeout,
 						self._method, self._endpoint, vhost, self._proxy,
-						self._logh, self._quiet, self._cookies
+						self._logh, self._quiet, self._cookies,
+						extra_headers=self._headers,
 					)
 					scanner.run(adv_print, adv_write)
 				else:
@@ -389,13 +417,14 @@ class Desyncr():
 					self._host, self._port, self.ssl_flag, self._timeout,
 					self._method, self._endpoint, vhost, self._proxy,
 					self._logh, self._quiet, self._cookies, pause_timeout,
-					oracle=oracle,
+					oracle=oracle, extra_headers=self._headers,
 				)
 			else:
 				scanner = scan_cls(
 					self._host, self._port, self.ssl_flag, self._timeout,
 					self._method, self._endpoint, vhost, self._proxy,
 					self._logh, self._quiet, self._cookies, oracle=oracle,
+					extra_headers=self._headers,
 				)
 			scanner.run(adv_print, adv_write)
 
@@ -412,7 +441,8 @@ class Desyncr():
 		
 		if len(self._cookies) > 0:
 			te_payload.header += "Cookie: " + ''.join(self._cookies) + "\r\n"
-		
+		te_payload.header = self._apply_extra_headers(te_payload.header)
+
 		if not ptype:
 			te_payload.cl = 6 # timeout val == 6, good value == 5
 		else:
@@ -433,7 +463,8 @@ class Desyncr():
 		
 		if len(self._cookies) > 0:
 			te_payload.header += "Cookie: " + ''.join(self._cookies) + "\r\n"
-			
+		te_payload.header = self._apply_extra_headers(te_payload.header)
+
 		if not ptype:
 			te_payload.cl = 4 # timeout val == 4, good value == 11
 		else:
@@ -564,6 +595,7 @@ class Desyncr():
 		attack.endpoint = self._endpoint
 		if len(self._cookies) > 0:
 			attack.header += "Cookie: " + ''.join(self._cookies) + "\r\n"
+		attack.header = self._apply_extra_headers(attack.header)
 
 		if mode == "clte":
 			# CL.TE: front-end uses Content-Length, reads only what fits;
