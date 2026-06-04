@@ -7,13 +7,9 @@ fire (or don't fire) for each example file.
 """
 
 import io
-import os
 from contextlib import redirect_stdout
 
 import smuggler
-
-
-HERE = os.path.dirname(__file__)
 
 
 def _validate_and_capture(path):
@@ -24,36 +20,78 @@ def _validate_and_capture(path):
 	return buf.getvalue()
 
 
-def test_clean_request_emits_no_warnings():
-	# req_clean.txt is a vanilla GET with no body and no extras.
-	out = _validate_and_capture(os.path.join(HERE, "req_clean.txt"))
+def _write(tmp_path, text, name="req.txt"):
+	# Fixtures are synthesized inline with synthetic hosts/tokens. We
+	# deliberately do NOT ship real captured requests as files: prior sample
+	# fixtures embedded real engagement hosts and a live Bearer JWT, which must
+	# never land in the repo.
+	p = tmp_path / name
+	p.write_text(text)
+	return str(p)
+
+
+def test_clean_request_emits_no_warnings(tmp_path):
+	# A vanilla GET with no body and no extras must not trip any detector.
+	req = (
+		"GET /app HTTP/1.1\r\n"
+		"Host: example.com\r\n"
+		"Accept: application/json\r\n"
+		"\r\n"
+	)
+	out = _validate_and_capture(_write(tmp_path, req))
 	assert "Notice:" not in out
 	assert "body bytes" not in out
 	assert "embedded" not in out
 
 
-def test_poc_smuggle_request_is_warned():
-	# req_poc.txt is a deliberate smuggling POC -- both the body-prefix
-	# and embedded-request-line detectors should fire.
-	out = _validate_and_capture(os.path.join(HERE, "req_poc.txt"))
+def test_poc_smuggle_request_is_warned(tmp_path):
+	# A deliberate smuggling POC: chunked body whose terminator is followed by
+	# a smuggled request line. Both the body-bytes and embedded-request-line
+	# detectors should fire.
+	req = (
+		"POST /submit HTTP/1.1\r\n"
+		"Host: example.com\r\n"
+		"Content-Type: application/x-www-form-urlencoded\r\n"
+		"Content-Length: 6\r\n"
+		"Transfer-Encoding: chunked\r\n"
+		"\r\n"
+		"0\r\n"
+		"\r\n"
+		"GET /admin HTTP/1.1\r\n"
+		"X: "
+	)
+	out = _validate_and_capture(_write(tmp_path, req))
 	assert "Notice:" in out
 	assert "embedded request line" in out
 
 
-def test_existing_legacy_examples_are_warned():
-	# The pre-existing req1.txt / req2.txt / req3.txt sample files are
-	# *also* POC-shaped (body begins with a smuggled request line). We
-	# want the validator to flag them rather than silently use them as
-	# templates.
-	for name in ("req1.txt", "req2.txt", "req3.txt"):
-		out = _validate_and_capture(os.path.join(HERE, name))
-		assert "Notice:" in out, "expected warning for %s" % name
+def test_body_request_line_pocs_are_warned(tmp_path):
+	# POC-shaped files whose body is itself a second request line. The
+	# validator should flag them rather than silently use them as templates.
+	for i, smuggled in enumerate(("GET /other HTTP/1.1", "POST /admin HTTP/1.1")):
+		req = (
+			"GET /app HTTP/1.1\r\n"
+			"Host: example.com\r\n"
+			"\r\n"
+			+ smuggled + "\r\n"
+			"X: "
+		)
+		out = _validate_and_capture(_write(tmp_path, req, name="poc%d.txt" % i))
+		assert "Notice:" in out, "expected warning for %r" % smuggled
 		assert "embedded request line" in out
 
 
-def test_poc_in_header_value_is_warned():
-	# baseline_test.txt embeds GET/POST inside an Authorization header value.
-	out = _validate_and_capture(os.path.join(HERE, "baseline_test.txt"))
+def test_poc_in_header_value_is_warned(tmp_path):
+	# A request line embedded inside an Authorization header value (the
+	# Bearer-token-style POC). Token is synthetic.
+	req = (
+		"GET /404 HTTP/1.1\r\n"
+		"Host: example.com\r\n"
+		"Authorization: Bearer GET /x?a=1 HTTP/1.1\r\n"
+		"Accept: application/json\r\n"
+		"\r\n"
+	)
+	out = _validate_and_capture(_write(tmp_path, req))
 	assert "Notice:" in out
 
 
