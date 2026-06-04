@@ -92,7 +92,14 @@ class EasySSL():
 			self.s.connect((host, port))
 		
 		if (self.SSLFlag):
-			self.context = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
+			# PROTOCOL_TLS_CLIENT auto-negotiates 1.2 AND 1.3 (the old
+			# PROTOCOL_TLSv1_2 pin is deprecated and fails the handshake against
+			# TLS1.3-only targets). It defaults to cert verification, which we
+			# explicitly disable -- this is a security testing tool that must
+			# reach self-signed / misconfigured hosts, mirroring EasyH2 below.
+			self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+			self.context.check_hostname = False
+			self.context.verify_mode = ssl.CERT_NONE
 			self.ssl = self.context.wrap_socket(self.s, server_hostname=host)
 			self.ssl.settimeout(timeout)
 		
@@ -111,12 +118,30 @@ class EasySSL():
 			del self.s
 		self.connected = False
 		
-	# send() - Sends data through the socket
+	# send() - Sends data through the socket.
+	#
+	# NOTE: a single ssl.send()/socket.send() may write FEWER bytes than given
+	# (short write under congestion or when the payload exceeds one TLS record).
+	# Callers here pipeline whole requests and rely on every byte landing, so we
+	# loop until the buffer is fully flushed. Truncating a request mid-stream
+	# silently corrupts the probe and produces false negatives -- especially now
+	# that requests can carry long Authorization headers.
 	def send(self, data):
-		if (self.SSLFlag and hasattr(self, 'ssl')):
-			return self.ssl.send(data)
-		else:
-			return self.s.send(data)
+		if isinstance(data, str):
+			data = data.encode('latin-1')
+		sock = self.ssl if (self.SSLFlag and hasattr(self, 'ssl')) else self.s
+		total = len(data)
+		sent = 0
+		while sent < total:
+			n = sock.send(data[sent:])
+			if n is None:
+				# Defensive: a wrapped socket should never return None, but
+				# treat it as "nothing flushed" rather than spin forever.
+				raise OSError("socket.send returned None")
+			if n == 0:
+				raise OSError("socket connection broken during send")
+			sent += n
+		return sent
 		
 	def recv(self):
 		try:
@@ -173,8 +198,16 @@ class EasySSL():
 		data = b""
 		sock = self.ssl if (self.SSLFlag and hasattr(self, 'ssl')) else self.s
 		sock.settimeout(timeout)
+		# After the first chunk we shorten the per-recv timeout to 0.5s so a
+		# normal response drains quickly on the idle gap. But a server that
+		# drips a byte every <0.5s could keep that loop alive indefinitely, so
+		# we also bound the TOTAL wall-clock to `timeout` (the contract callers
+		# rely on for timing baselines and fingerprinting).
+		deadline = time.monotonic() + timeout
 		try:
 			while len(data) < max_size:
+				if time.monotonic() >= deadline:
+					break
 				chunk = sock.recv(self.bufsize)
 				if not chunk:
 					break
@@ -324,7 +357,7 @@ class EasySSL():
 							elif (CL_TE == 1):
 								state = ST_PROCESS_BODY_TE
 							else:
-								state = ST_PROCESS_NODATA
+								state = ST_PROCESS_BODY_NODATA
 								return (cls, dat_dec)
 							break
 						

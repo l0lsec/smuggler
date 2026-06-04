@@ -55,6 +55,106 @@ try:
 except ImportError:
 	H2_SCAN_AVAILABLE = False
 
+
+def _safe_host_slug(host):
+	"""Sanitize a host string for use inside a payload filename.
+
+	The host can come from a pasted request's Host header, so it is untrusted:
+	stripping only '.' (the old behavior) let path separators, '..', null bytes
+	etc. survive into the filename and potentially escape payloads/. Collapse to
+	a conservative [A-Za-z0-9_-] slug.
+	"""
+	slug = re.sub(r'[^A-Za-z0-9_-]', '_', (host or "").replace('.', '_'))
+	return slug or "host"
+
+
+def _payloads_dir():
+	"""Absolute path to the repo's payloads/ directory, resolving a symlinked
+	argv[0] the same way the original write paths did."""
+	if os.path.islink(sys.argv[0]):
+		_me = os.readlink(sys.argv[0])
+	else:
+		_me = sys.argv[0]
+	return os.path.join(os.path.realpath(os.path.dirname(_me)), "payloads")
+
+
+SMUGGLER_VERSION = "1.0"
+
+
+def findings_to_json(findings, target=None):
+	"""Aggregate run report. Pure function -- easy to unit test."""
+	import datetime as _dt
+	return {
+		"tool": "smuggler",
+		"version": SMUGGLER_VERSION,
+		"target": target,
+		"generated_at": _dt.datetime.utcnow().isoformat() + "Z",
+		"finding_count": len(findings),
+		"findings": findings,
+	}
+
+
+def findings_to_sarif(findings, target=None):
+	"""Minimal SARIF 2.1.0 log. Each finding becomes a result whose ruleId is
+	its desync type and whose location points at the payload artifact. Pure
+	function so it can be asserted on in tests."""
+	rule_ids = []
+	seen = set()
+	for f in findings:
+		rid = f.get("type") or "desync"
+		if rid not in seen:
+			seen.add(rid)
+			rule_ids.append(rid)
+	results = []
+	for f in findings:
+		msg = "%s desync detected" % (f.get("type") or "Unknown")
+		if f.get("mutation"):
+			msg += " (mutation=%s)" % f["mutation"]
+		result = {
+			"ruleId": f.get("type") or "desync",
+			"level": "error",
+			"message": {"text": msg},
+		}
+		pf = f.get("payload_file")
+		if pf:
+			result["locations"] = [{
+				"physicalLocation": {
+					"artifactLocation": {"uri": pf}
+				}
+			}]
+		props = {k: f[k] for k in (
+			"host", "url", "method", "status_label", "gadget_hit",
+			"confidence", "timing_s", "configfile") if f.get(k) is not None}
+		if props:
+			result["properties"] = props
+		results.append(result)
+	return {
+		"$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+		"version": "2.1.0",
+		"runs": [{
+			"tool": {"driver": {
+				"name": "smuggler",
+				"version": SMUGGLER_VERSION,
+				"rules": [{"id": rid} for rid in rule_ids],
+			}},
+			"results": results,
+		}],
+	}
+
+
+def write_findings_report(findings, path, fmt="json", target=None):
+	"""Serialize findings to `path` in the requested format. Returns the number
+	of findings written. Raises OSError on write failure (caller decides)."""
+	import json as _json
+	if fmt == "sarif":
+		doc = findings_to_sarif(findings, target)
+	else:
+		doc = findings_to_json(findings, target)
+	with open(path, "w", encoding="utf-8") as f:
+		_json.dump(doc, f, indent=2)
+	return len(findings)
+
+
 class Desyncr():
 	def __init__(self, configfile, smhost, smport=443, url="", method="POST", endpoint="/",
 			SSLFlag=False, logh=None, custom_request=None,
@@ -74,6 +174,7 @@ class Desyncr():
 		self._exit_early = exit_early
 		self._cookies = []
 		self._headers = []
+		self._findings = []
 		self._proxy = proxy
 		self._custom_request = custom_request
 		self._persistent_connection = persistent_connection
@@ -149,6 +250,26 @@ class Desyncr():
 			header_str += "\r\n"
 		header_str += ''.join(h + "\r\n" for h in self._headers)
 		return header_str
+
+	def _record_finding(self, ptype, host=None, payload_file=None, mutation=None,
+			status_label=None, gadget_hit=False, confidence=None, timing=None,
+			configfile=None):
+		"""Append a normalized finding record to the in-memory registry that
+		feeds --output-json / --output-sarif. Both scan paths call this; the
+		advanced path supplies only what it knows and leaves the rest null."""
+		self._findings.append({
+			"type": ptype,
+			"mutation": mutation,
+			"host": host,
+			"url": self._url,
+			"method": self._method,
+			"payload_file": payload_file,
+			"status_label": status_label,
+			"gadget_hit": bool(gadget_hit),
+			"confidence": confidence,
+			"timing_s": timing,
+			"configfile": configfile,
+		})
 
 	def _establish_persistent_connection(self):
 		"""Establish a persistent connection if enabled"""
@@ -343,16 +464,9 @@ class Desyncr():
 				self._logh.flush()
 
 		def adv_write(smhost, payload, ptype):
-			furl = smhost.replace('.', '_')
-			if self.ssl_flag:
-				furl = "https_" + furl
-			else:
-				furl = "http_" + furl
-			if os.path.islink(sys.argv[0]):
-				_me = os.readlink(sys.argv[0])
-			else:
-				_me = sys.argv[0]
-			fname = os.path.realpath(os.path.dirname(_me)) + "/payloads/%s_%s.txt" % (furl, ptype)
+			scheme = "https" if self.ssl_flag else "http"
+			furl = "%s_%s" % (scheme, _safe_host_slug(smhost))
+			fname = os.path.join(_payloads_dir(), "%s_%s.txt" % (furl, ptype))
 			adv_print("CRITICAL", "%s Payload: %s URL: %s" % \
 				(Fore.MAGENTA + ptype, Fore.CYAN + fname + Fore.MAGENTA, Fore.CYAN + self._url))
 			with open(fname, 'wb') as file:
@@ -360,6 +474,7 @@ class Desyncr():
 					file.write(payload.to_bytes())
 				else:
 					file.write(bytes(str(payload), 'utf-8'))
+			self._record_finding(ptype, host=smhost, payload_file=fname)
 
 		if not self._get_cookies():
 			return
@@ -696,16 +811,9 @@ class Desyncr():
 		def write_payload(smhost, payload, ptype, response=None,
 				status_code=None, timing=None, confidence=None,
 				gadget_hit=False):
-			furl = smhost.replace('.', '_')
-			if (self.ssl_flag):
-				furl = "https_" + furl
-			else:
-				furl = "http_" + furl
-			if os.path.islink(sys.argv[0]):
-				_me = os.readlink(sys.argv[0])
-			else:
-				_me = sys.argv[0]
-			fname = os.path.realpath(os.path.dirname(_me)) + "/payloads/%s_%s_%s.txt" % (furl,ptype,name)
+			scheme = "https" if self.ssl_flag else "http"
+			furl = "%s_%s" % (scheme, _safe_host_slug(smhost))
+			fname = os.path.join(_payloads_dir(), "%s_%s_%s.txt" % (furl, ptype, name))
 			pretty_print("CRITICAL", "%s Payload: %s URL: %s\n" % \
 			(Fore.MAGENTA+ptype, Fore.CYAN+fname+Fore.MAGENTA, Fore.CYAN+self._url))
 			with open(fname, 'wb') as file:
@@ -756,6 +864,13 @@ class Desyncr():
 					_json.dump(meta, f, indent=2)
 			except OSError:
 				pass
+
+			self._record_finding(
+				ptype, host=smhost, payload_file=fname, mutation=name,
+				status_label=status_label, gadget_hit=bool(gadget_hit),
+				confidence=confidence,
+				timing=round(timing, 3) if timing is not None else None,
+				configfile=self._configfile.split('/')[-1])
 
 		# Initial probe pair
 		pretty_print(name, "Checking TECL...")
@@ -1509,6 +1624,8 @@ if __name__ == "__main__":
 	Parser.add_argument('--scan-type', default="tecl,clte", help="Comma-separated scan types: tecl,clte,cl0,pause,connection-state,parser-discrepancy,header-removal,expect,te0,bare-lf,hop-by-hop,h2,all (default: tecl,clte)")
 	Parser.add_argument('--http2', action='store_true', help="Enable HTTP/2 downgrade scans")
 	Parser.add_argument('--pause-timeout', type=int, default=61, help="Timeout in seconds for pause-based desync (default: 61)")
+	Parser.add_argument('--output-json', metavar="PATH", help="Write an aggregate machine-readable findings report to PATH at the end of the run")
+	Parser.add_argument('--output-format', choices=("json", "sarif"), default="json", help="Format for --output-json: json (default) or sarif (SARIF 2.1.0)")
 	Parser.add_argument('--confirm', action='store_true', help="Self-contained confirmation: replay a finding from payloads/ on a single connection using only your own requests (no third-party traffic)")
 	Parser.add_argument('--confirm-payload', help="Path to the payloads/*.txt finding to confirm (skips the interactive picker)")
 	Parser.add_argument('--confirm-followup', help="Optional file with your own follow-up request (prefix/pause modes); a benign canary GET is synthesized if omitted")
@@ -1571,8 +1688,18 @@ if __name__ == "__main__":
 		port = 443  # Default HTTPS port
 		ssl_flag = True  # Default to HTTPS
 		
-		# Check if host contains a port
-		if ':' in host:
+		# Check if host contains a port. Handle bracketed IPv6 literals
+		# ("[::1]:8080") specially -- a naive split(':') would mangle them.
+		if host.startswith('['):
+			# IPv6 literal, optionally followed by :port outside the brackets.
+			close = host.find(']')
+			if close != -1:
+				port_part = host[close + 1:]
+				host = host[1:close]
+				if port_part.startswith(':'):
+					port = int(port_part[1:])
+					ssl_flag = port != 80
+		elif ':' in host:
 			host, port_str = host.split(':', 1)
 			port = int(port_str)
 			ssl_flag = port != 80  # Assume HTTPS unless port 80
@@ -1638,6 +1765,7 @@ if __name__ == "__main__":
 			print(Parser.print_help())
 			sys.exit(1)
 
+	all_findings = []
 	for server in Servers:
 		# If the next on the list is blank, continue
 		if server == "":
@@ -1693,13 +1821,25 @@ if __name__ == "__main__":
 			sm = Desyncr.from_args(configfile, host, port, server[0], method, endpoint,
 				SSLFlagval, FileHandle, Args, custom_request=custom_request)
 			sm.run()
+			all_findings.extend(sm._findings)
 
 		if advanced_scans:
 			print_info("Advanced   : %s"%(Fore.CYAN + ", ".join(advanced_scans)), FileHandle)
 			sm_adv = Desyncr.from_args(configfile, host, port, server[0], method, endpoint,
 				SSLFlagval, FileHandle, Args, custom_request=custom_request)
 			sm_adv.run_advanced_scans(advanced_scans, pause_timeout=Args.pause_timeout)
+			all_findings.extend(sm_adv._findings)
 
+
+	if getattr(Args, 'output_json', None):
+		try:
+			n = write_findings_report(all_findings, Args.output_json,
+				fmt=Args.output_format, target=getattr(Args, 'url', None) or None)
+			print_info("Report     : %s (%d findings, %s)" % (
+				Fore.CYAN + Args.output_json + Fore.MAGENTA, n, Args.output_format),
+				FileHandle)
+		except OSError as e:
+			print_info("Error: could not write report to %s: %s" % (Args.output_json, e), FileHandle)
 
 	if FileHandle is not None:
 		FileHandle.close()

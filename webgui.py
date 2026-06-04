@@ -48,6 +48,44 @@ PAYLOADS_DIR = SMUGGLER_DIR / "payloads"
 TMP_DIR = SMUGGLER_DIR / "tmp" / "webgui"
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
+# Inline-pasted requests can carry live credentials (Bearer JWTs, session
+# cookies). We materialize them to TMP_DIR only for the duration of a run and
+# delete them afterward; this startup sweep also clears anything an earlier
+# crash left behind so secrets don't accumulate on disk indefinitely.
+_TMP_TTL_SECONDS = 6 * 3600
+
+
+def _sweep_stale_tmp(ttl_seconds: int = _TMP_TTL_SECONDS) -> None:
+	try:
+		cutoff = time.time() - ttl_seconds
+		for p in TMP_DIR.iterdir():
+			try:
+				if p.is_file() and p.stat().st_mtime < cutoff:
+					p.unlink()
+			except OSError:
+				pass
+	except OSError:
+		pass
+
+
+def _cleanup_tmp_files(paths) -> None:
+	"""Best-effort delete of temp files we created for one run. Only removes
+	paths that live under TMP_DIR, so user-provided request paths are never
+	touched."""
+	tmp_root = str(TMP_DIR.resolve())
+	for raw in paths or ():
+		if not raw:
+			continue
+		try:
+			rp = Path(raw).resolve()
+			if str(rp).startswith(tmp_root) and rp.is_file():
+				rp.unlink()
+		except OSError:
+			pass
+
+
+_sweep_stale_tmp()
+
 SCAN_TYPES = [
 	"tecl", "clte", "cl0", "pause", "connection-state",
 	"parser-discrepancy", "header-removal", "expect",
@@ -268,6 +306,9 @@ class RunState:
 		self.task: Optional[asyncio.Task] = None
 		self.started_at: float = 0.0
 		self.argv: list[str] = []
+		# Temp files (inline-pasted requests, possibly holding live creds)
+		# created for the current run; deleted when the run finishes.
+		self.tmp_files: list[str] = []
 
 	def is_running(self) -> bool:
 		return self.proc is not None and self.proc.returncode is None
@@ -345,6 +386,10 @@ async def stream_process(
 		rc = await proc.wait()
 		on_exit(rc)
 		state.proc = None
+		# Delete inline-request temp files now that the subprocess has read
+		# them, so pasted credentials don't linger on disk.
+		_cleanup_tmp_files(state.tmp_files)
+		state.tmp_files = []
 
 
 async def stop_process(state: RunState, on_line) -> None:
@@ -1398,6 +1443,14 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 			return
 
 		argv = build_argv(cfg, req_path, baseline_path)
+		# Mark inline-synthesized request/baseline files for post-run deletion
+		# (they may contain pasted credentials). Uploaded / path-mode files are
+		# the user's own and left alone.
+		state.tmp_files = []
+		if cfg.mode == "request" and cfg.request_source == "inline" and req_path:
+			state.tmp_files.append(req_path)
+		if cfg.baseline_source == "inline" and baseline_path:
+			state.tmp_files.append(baseline_path)
 		clear_log()
 		findings.clear()
 		pending_finding["f"] = None
@@ -1449,9 +1502,12 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 			argv += ["--proxy", cfg.proxy.strip()]
 		if cfg.cookies.strip():
 			argv += ["--cookies", cfg.cookies]
+		state.tmp_files = []
 		followup = (confirm_followup.value or "").strip()
 		if followup:
-			argv += ["--confirm-followup", _write_tmp_request("confirm-followup", followup)]
+			fpath = _write_tmp_request("confirm-followup", followup)
+			argv += ["--confirm-followup", fpath]
+			state.tmp_files.append(fpath)
 
 		clear_log()
 		push_log(f"\x1B[36m$ {' '.join(shlex.quote(a) for a in argv)}\x1B[0m\n")
