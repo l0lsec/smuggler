@@ -145,3 +145,35 @@ def test_cleanup_tmp_files_scoped_to_tmp_dir(tmp_path):
 
 	assert not inside.exists()
 	assert outside.exists()
+
+
+# ----- Finding artifact sidecars (response/baseline/meta) ----------------
+
+def test_write_finding_artifacts_roundtrip(tmp_path):
+	from pathlib import Path
+	import json
+	d = smuggler.Desyncr("default.py", "example.com", quiet=True)
+
+	base = str(tmp_path / "finding")
+	meta = {"kind": "PARSERDISC_x", "attack_status": "400", "baseline_status": "200"}
+	d._write_finding_artifacts(
+		base,
+		response="HTTP/1.1 400 Bad Request\r\n\r\nnope",
+		baseline="HTTP/1.1 200 OK\r\n\r\nyes",
+		meta=meta,
+	)
+	assert Path(base + ".response.txt").read_bytes() == b"HTTP/1.1 400 Bad Request\r\n\r\nnope"
+	assert Path(base + ".baseline.txt").read_bytes() == b"HTTP/1.1 200 OK\r\n\r\nyes"
+	m = json.loads(Path(base + ".meta.json").read_text())
+	assert m["attack_status"] == "400" and m["baseline_status"] == "200"
+
+
+def test_write_finding_artifacts_no_baseline(tmp_path):
+	from pathlib import Path
+	d = smuggler.Desyncr("default.py", "example.com", quiet=True)
+	base = str(tmp_path / "f2")
+	# .response.txt is always written (even empty); .baseline.txt only when given.
+	d._write_finding_artifacts(base, response=None, meta={"kind": "k"})
+	assert Path(base + ".response.txt").exists()
+	assert Path(base + ".response.txt").read_bytes() == b""
+	assert not Path(base + ".baseline.txt").exists()

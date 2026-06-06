@@ -173,7 +173,7 @@ def test_scan_cl0_accepts_oracle_kwarg(server_factory):
 	prints, writes = [], []
 	found = scanner.run(
 		lambda n, m: prints.append((n, m)),
-		lambda h, p, t: writes.append((h, t, p)),
+		lambda h, p, t, **kw: writes.append((h, t, p)),
 	)
 	assert found is True
 	assert any(ptype.startswith("CL0") or ptype.startswith("0CL") for _h, ptype, _p in writes)
@@ -192,7 +192,7 @@ def test_scan_hopbyhop_accepts_oracle_kwarg(server_factory):
 	prints, writes = [], []
 	found = scanner.run(
 		lambda n, m: prints.append((n, m)),
-		lambda h, p, t: writes.append((h, t, p)),
+		lambda h, p, t, **kw: writes.append((h, t, p)),
 	)
 	# Compliant server should produce no finding -- but the call must
 	# not raise on the oracle= kwarg.

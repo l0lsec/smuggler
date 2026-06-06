@@ -469,6 +469,18 @@ def human_size(n: int) -> str:
 # The bytes that *cause* the desync (bare LF, tab, 0x09, 0xa0, etc.) are
 # invisible in a plain text view, so the GUI needs a hex view too.
 
+def _payload_txt_files() -> list:
+	"""Real finding payloads under PAYLOADS_DIR. Excludes the `.response.txt`
+	and `.baseline.txt` sidecars, which share the `.txt` suffix and would
+	otherwise be mistaken for standalone payloads in every listing."""
+	try:
+		return [p for p in PAYLOADS_DIR.glob("*.txt")
+			if not p.name.endswith(".response.txt")
+			and not p.name.endswith(".baseline.txt")]
+	except OSError:
+		return []
+
+
 def _parse_payload_meta(path: Path) -> dict:
 	"""Read a payload file and pull out the bits the GUI needs.
 
@@ -508,6 +520,12 @@ def _parse_payload_meta(path: Path) -> dict:
 		response_raw = Path(base + ".response.txt").read_bytes()
 	except (OSError, FileNotFoundError):
 		response_raw = None
+	# Baseline/control response (advanced diff-based findings only).
+	baseline_raw: Optional[bytes] = None
+	try:
+		baseline_raw = Path(base + ".baseline.txt").read_bytes()
+	except (OSError, FileNotFoundError):
+		baseline_raw = None
 	sidecar_meta: dict = {}
 	try:
 		import json as _json
@@ -523,6 +541,7 @@ def _parse_payload_meta(path: Path) -> dict:
 		"scan_type": scan_type,
 		"mutation": mutation,
 		"response_raw": response_raw,
+		"baseline_raw": baseline_raw,
 		"sidecar_meta": sidecar_meta,
 	}
 
@@ -1465,7 +1484,7 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 		# refresher below.
 		payload_state["new"] = set()
 		try:
-			payload_state["known"] = {p.name for p in PAYLOADS_DIR.glob("*.txt")}
+			payload_state["known"] = {p.name for p in _payload_txt_files()}
 		except OSError:
 			payload_state["known"] = set()
 		payload_state["last_signature"] = None
@@ -1517,7 +1536,7 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 		replay_card.set_visibility(False)
 		payload_state["new"] = set()
 		try:
-			payload_state["known"] = {p.name for p in PAYLOADS_DIR.glob("*.txt")}
+			payload_state["known"] = {p.name for p in _payload_txt_files()}
 		except OSError:
 			payload_state["known"] = set()
 		payload_state["last_signature"] = None
@@ -1549,6 +1568,10 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 			pd_tab_req_hex = ui.tab("req_hex", label="Request — hex")
 			pd_tab_res_text = ui.tab("res_text", label="Response — annotated")
 			pd_tab_res_hex = ui.tab("res_hex", label="Response — hex")
+			# Baseline/control response — only shown for diff-based findings
+			# that captured one (hidden otherwise).
+			pd_tab_base_text = ui.tab("base_text", label="Baseline — annotated")
+			pd_tab_base_hex = ui.tab("base_hex", label="Baseline — hex")
 		with ui.tab_panels(pd_tabs, value=pd_tab_req_text).classes("w-full"):
 			with ui.tab_panel(pd_tab_req_text):
 				pd_req_text = ui.html("", sanitize=False).classes(
@@ -1562,6 +1585,12 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 			with ui.tab_panel(pd_tab_res_hex):
 				pd_res_hex = ui.html("", sanitize=False).classes(
 					"smug-log w-full whitespace-pre")
+			with ui.tab_panel(pd_tab_base_text):
+				pd_base_text = ui.html("", sanitize=False).classes(
+					"smug-log w-full whitespace-pre-wrap")
+			with ui.tab_panel(pd_tab_base_hex):
+				pd_base_hex = ui.html("", sanitize=False).classes(
+					"smug-log w-full whitespace-pre")
 		ui.separator()
 		with ui.row().classes("w-full justify-between items-center"):
 			pd_repro = ui.label("").classes(
@@ -1570,11 +1599,22 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 				pd_copy_btn = ui.button("Copy repro cmd", icon="content_copy") \
 					.props("flat dense")
 				ui.button("Close", on_click=payload_dlg.close).props("flat")
+		# The dialog is built once and reused for every payload. Register the
+		# copy handler ONCE here, reading the current command from a mutable
+		# holder that view_payload updates -- re-registering on_click per view
+		# would stack handlers (NiceGUI's on_click ADDS, never replaces), so the
+		# Nth view would fire N copies/notifications.
+		current_repro = {"cmd": ""}
+		pd_copy_btn.on_click(lambda _=None: (
+			ui.run_javascript(f"navigator.clipboard.writeText({_js_str(current_repro['cmd'])})"),
+			ui.notify("Reproduction command copied"),
+		))
 
 	def view_payload(path: Path) -> None:
 		meta = _parse_payload_meta(path)
 		side = meta.get("sidecar_meta") or {}
 		resp = meta.get("response_raw")
+		baseline = meta.get("baseline_raw")
 		pd_title.set_text(path.name)
 		# Build the response-bytes summary. Three states:
 		#   - resp bytes present  → "response: N bytes"
@@ -1595,19 +1635,30 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 			resp_summary = "response: 0 bytes"
 		else:
 			resp_summary = "response: (not captured)"
+		# Status comparison for diff-based findings (e.g. "attack: 400 vs base: 200").
+		_astat = side.get("attack_status")
+		_bstat = side.get("baseline_status")
+		status_cmp = ""
+		if _astat or _bstat:
+			status_cmp = f"   |   attack: {_astat or '?'} vs baseline: {_bstat or '?'}"
 		pd_meta.set_text(
 			f"{meta['scheme']}://{meta.get('host') or '?'}:{meta['port']}"
-			f"   |   scan: {meta['scan_type']}   |   mutation: {meta['mutation']}"
+			f"   |   scan: {side.get('scan') or meta['scan_type']}   |   mutation: {side.get('mutation') or meta['mutation']}"
 			f"   |   request: {len(meta['raw'])} bytes   |   {resp_summary}"
+			f"{status_cmp}"
 		)
 		# Second meta line: run-time context from .meta.json (when present)
 		if side:
 			parts = []
+			if side.get("label"):
+				parts.append(f"verdict: {side['label']}")
 			conf = side.get("confidence")
 			if conf:
 				parts.append(f"confidence: {str(conf).upper()}")
 			if side.get("gadget_hit"):
 				parts.append("gadget: HIT")
+			if side.get("fp_axes"):
+				parts.append("fp: " + "+".join(side["fp_axes"]))
 			if side.get("status_label"):
 				parts.append(f"status: {side['status_label']}")
 			if side.get("timing_s") is not None:
@@ -1715,15 +1766,53 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 			elif len(data) == 0:
 				note = ('<div style="color:#fde68a;padding:6px 10px">'
 					'(back-end returned a zero-length body)</div>')
-			pd_res_text.content = note + _render_text_html(view)
+			# "Both" view: when a baseline was captured, stack a compact baseline
+			# block above the attack response in the annotated panel for instant
+			# comparison; the dedicated Baseline tab carries the full detail.
+			stacked = ""
+			if baseline is not None:
+				bview = baseline[:cap]
+				bnote_inline = ""
+				if len(baseline) > cap:
+					bnote_inline = (f'<div style="color:#fde68a;padding:6px 10px">'
+						f'(showing first {cap} of {len(baseline)} bytes — full '
+						f'baseline on disk in {path.name[:-4]}.baseline.txt)</div>')
+				stacked = (
+					f'<div style="color:#93c5fd;padding:4px 10px;font-weight:600">'
+					f'=== BASELINE (status {_bstat or "?"}) ===</div>'
+					+ bnote_inline
+					+ _render_text_html(bview)
+					+ f'<div style="color:#fca5a5;padding:10px 10px 4px;font-weight:600">'
+					f'=== ATTACK (status {_astat or "?"}) ===</div>'
+				)
+			pd_res_text.content = stacked + note + _render_text_html(view)
 			pd_res_hex.content = note + _render_hex_html(view)
+
+		# Dedicated Baseline tabs — populated and shown only when a baseline
+		# response was captured (diff-based findings).
+		has_baseline = baseline is not None
+		pd_tab_base_text.set_visibility(has_baseline)
+		pd_tab_base_hex.set_visibility(has_baseline)
+		if has_baseline:
+			bcap = 32 * 1024
+			bview = baseline[:bcap]
+			bnote = ""
+			if len(baseline) > bcap:
+				bnote = (f'<div style="color:#fde68a;padding:6px 10px">'
+					f'(showing first {bcap} of {len(baseline)} bytes — full '
+					f'baseline on disk in {path.name[:-4]}.baseline.txt)</div>')
+			elif len(baseline) == 0:
+				bnote = ('<div style="color:#fde68a;padding:6px 10px">'
+					'(baseline returned a zero-length body)</div>')
+			pd_base_text.content = bnote + _render_text_html(bview)
+			pd_base_hex.content = bnote + _render_hex_html(bview)
+		else:
+			pd_base_text.content = ""
+			pd_base_hex.content = ""
 
 		repro = _repro_cmd_for_payload(path, meta)
 		pd_repro.set_text("$ " + repro)
-		pd_copy_btn.on_click(lambda _=None, c=repro: (
-			ui.run_javascript(f"navigator.clipboard.writeText({_js_str(c)})"),
-			ui.notify("Reproduction command copied"),
-		))
+		current_repro["cmd"] = repro  # handler registered once at dialog build
 		payload_dlg.open()
 
 	def stage_replay(path: Path) -> None:
@@ -1948,7 +2037,7 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 		Dedupes by payload filename so clicking twice is a no-op.
 		"""
 		try:
-			files = sorted(PAYLOADS_DIR.glob("*.txt"),
+			files = sorted(_payload_txt_files(),
 				key=lambda p: p.stat().st_mtime, reverse=True)
 		except OSError:
 			files = []
@@ -2030,7 +2119,7 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 					.classes("text-xs text-gray-500")
 			return
 		try:
-			files = sorted(PAYLOADS_DIR.glob("*.txt"),
+			files = sorted(_payload_txt_files(),
 				key=lambda p: p.stat().st_mtime, reverse=True)
 		except OSError:
 			files = []
@@ -2123,7 +2212,7 @@ def main_page() -> None:  # noqa: C901 - flat layout, easier to read top-to-bott
 	# immediately without having to click anything.
 	if not findings:
 		try:
-			if any(PAYLOADS_DIR.glob("*.txt")):
+			if _payload_txt_files():
 				backfill_findings_from_disk()
 		except OSError:
 			pass

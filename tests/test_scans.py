@@ -28,8 +28,22 @@ def _print_capture(records):
 
 
 def _write_capture(records):
-	def _fn(host, payload, ptype):
+	# Absorbs the response/baseline/details kwargs the scanners now pass, but
+	# keeps the 3-tuple shape so existing assertions stay unchanged.
+	def _fn(host, payload, ptype, response=None, baseline=None, details=None):
 		records.append((host, ptype, payload))
+	return _fn
+
+
+def _write_capture_detailed(records):
+	"""Like _write_capture but records the captured response/baseline/details so
+	tests can assert the advanced scanners thread them through."""
+	def _fn(host, payload, ptype, response=None, baseline=None, details=None):
+		records.append({
+			"host": host, "ptype": ptype, "payload": payload,
+			"response": response, "baseline": baseline,
+			"details": details or {},
+		})
 	return _fn
 
 
@@ -206,6 +220,42 @@ def test_scan_header_removal_fp_only_detection(server_factory):
 	assert found is True
 	assert any(ptype == "HDRREMOVAL_FP" for _h, ptype, _p in writes), \
 		"expected HDRREMOVAL_FP payload, got: %r" % [t for _h, t, _p in writes]
+
+
+# ----- Response capture (sidecars) ---------------------------------------
+
+def test_parser_disc_threads_response_and_baseline(server_factory):
+	# The ParserDiscrepancy finding must now carry the attack response (400)
+	# AND the baseline response (200) so the GUI can show both.
+	port = server_factory("parser_disc_space")
+	prints, writes = [], []
+	scanner = ScanParserDiscrepancy(**_common_kwargs(port))
+
+	found = scanner.run(_print_capture(prints), _write_capture_detailed(writes))
+	assert found is True
+	rec = next(w for w in writes if "PARSERDISC" in w["ptype"])
+	assert rec["response"], "attack response should be captured"
+	assert rec["baseline"], "baseline response should be captured"
+	assert rec["details"].get("scan") == "parser-discrepancy"
+	assert rec["details"].get("attack_status")
+	assert rec["details"].get("baseline_status")
+
+
+def test_hopbyhop_threads_response_and_baseline(server_factory):
+	port = server_factory("hopbyhop_strip")
+	prints, writes = [], []
+	scanner = ScanHopByHop(**_common_kwargs(port))
+	# Seed an Authorization header so the strip is observable, mirroring the
+	# fp-only detection test's pattern.
+	orig = scanner._request
+	scanner._request = lambda extra: orig(["Authorization: Bearer good"] + extra)
+
+	found = scanner.run(_print_capture(prints), _write_capture_detailed(writes))
+	assert found is True
+	rec = next(w for w in writes if "HOPBYHOP" in w["ptype"])
+	assert rec["response"] is not None
+	assert rec["baseline"] is not None
+	assert rec["details"].get("scan") == "hop-by-hop"
 
 
 # ----- Custom-header injection -------------------------------------------

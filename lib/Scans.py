@@ -78,6 +78,17 @@ def _victim_baseline_for(scanner):
 		scanner.timeout, req, scanner.proxy, n=3,
 	)
 	scanner._victim_baseline_cache = (fp, noisy)
+	# Capture one raw baseline response too, so victim-leg findings can show a
+	# real control body in the GUI (not just the fingerprint). Best-effort.
+	scanner._victim_baseline_raw = None
+	try:
+		web = _make_connection(scanner.host, scanner.port, scanner.ssl_flag,
+			scanner.timeout, scanner.proxy)
+		web.send(req.encode())
+		scanner._victim_baseline_raw = _filter_response(web.recv_all(scanner.timeout))
+		web.close()
+	except Exception:
+		pass
 	return fp, noisy
 
 
@@ -355,7 +366,17 @@ class ScanCL0:
 								label, method, gadget["path"], ",".join(annot)))
 							raw = RawPayload()
 							raw.data = req.encode('latin-1')
-							write_fn(self.host, raw, ptype)
+							write_fn(self.host, raw, ptype,
+								response=second_resp,
+								baseline=getattr(self, "_victim_baseline_raw", None),
+								details={
+									"scan": "cl0",
+									"label": label,
+									"attack_status": _get_status(second_resp),
+									"baseline_status": baseline_fp.status,
+									"fp_axes": sorted(_structural_diff(victim_fp, baseline_fp, noisy)),
+									"gadget_hit": gadget_hit,
+								})
 							return True
 			except Exception:
 				continue
@@ -482,7 +503,17 @@ class ScanPauseDesync:
 							print_fn("Pause", "Potential pause-based desync confirmed [%s]" % ",".join(annot))
 							raw = RawPayload()
 							raw.data = (headers_part + "[PAUSE %ds]" % self.pause_timeout + smuggled_prefix).encode('latin-1')
-							write_fn(self.host, raw, "PAUSE")
+							write_fn(self.host, raw, "PAUSE",
+								response=second_resp,
+								baseline=getattr(self, "_victim_baseline_raw", None),
+								details={
+									"scan": "pause",
+									"label": gadget_label,
+									"attack_status": _get_status(second_resp),
+									"baseline_status": baseline_fp.status,
+									"fp_axes": sorted(_structural_diff(victim_fp, baseline_fp, noisy)),
+									"gadget_hit": gadget_hit,
+								})
 							return True
 			except Exception:
 				continue
@@ -551,6 +582,15 @@ class ScanConnectionState:
 			status_diverges = indirect_status and direct_status and indirect_status != direct_status
 			fp_diverges_only = (not status_diverges) and ("status" not in fp_diff) and (len(fp_diff) >= 2)
 
+			# Shared sidecar context: the reused-connection (indirect) leg is the
+			# anomaly; the direct single-connection request is the baseline.
+			_cs_details = {
+				"scan": "connection-state",
+				"attack_status": indirect_status,
+				"baseline_status": direct_status,
+				"fp_axes": sorted(fp_diff),
+			}
+
 			if status_diverges:
 				web3 = _make_connection(self.host, self.port, self.ssl_flag, self.timeout, self.proxy)
 				web3.pipeline_send([normal_req, canary_req])
@@ -564,7 +604,9 @@ class ScanConnectionState:
 						print_fn("ConnState", "Connection state discrepancy: direct=%s indirect=%s" % (direct_status, indirect_status))
 						raw = RawPayload()
 						raw.data = ("# Request 1 (setup):\n" + normal_req + "\n# Request 2 (canary):\n" + canary_req).encode('latin-1')
-						write_fn(self.host, raw, "CONNSTATE")
+						write_fn(self.host, raw, "CONNSTATE",
+							response=indirect_resp, baseline=direct_resp,
+							details=dict(_cs_details, label="CONNSTATE"))
 						found = True
 			elif fp_diverges_only:
 				# Status matched but the indirect response structurally
@@ -584,7 +626,9 @@ class ScanConnectionState:
 							direct_status, "+".join(sorted(fp_diff)) or "?"))
 						raw = RawPayload()
 						raw.data = ("# Request 1 (setup):\n" + normal_req + "\n# Request 2 (canary):\n" + canary_req).encode('latin-1')
-						write_fn(self.host, raw, "CONNSTATE_FP")
+						write_fn(self.host, raw, "CONNSTATE_FP",
+							response=indirect_resp, baseline=direct_resp,
+							details=dict(_cs_details, label="CONNSTATE_FP"))
 						found = True
 
 			indirect_canary_count = indirect_resp.count(canary) if indirect_resp else 0
@@ -594,7 +638,9 @@ class ScanConnectionState:
 				if not found:
 					raw = RawPayload()
 					raw.data = ("# Request 1 (setup):\n" + normal_req + "\n# Request 2 (canary):\n" + canary_req).encode('latin-1')
-					write_fn(self.host, raw, "CONNSTATE-REFLECT")
+					write_fn(self.host, raw, "CONNSTATE-REFLECT",
+						response=indirect_resp, baseline=direct_resp,
+						details=dict(_cs_details, label="CONNSTATE-REFLECT"))
 					found = True
 
 		except Exception:
@@ -766,7 +812,15 @@ class ScanParserDiscrepancy:
 							canary["name"], tech_name, label, probe_status, base_status, annotation))
 						raw = RawPayload()
 						raw.data = probe_req.encode('latin-1')
-						write_fn(self.host, raw, "PARSERDISC_%s_%s" % (tech_name, canary["name"]))
+						write_fn(self.host, raw, "PARSERDISC_%s_%s" % (tech_name, canary["name"]),
+							response=probe_resp, baseline=base_resp, details={
+								"scan": "parser-discrepancy",
+								"mutation": canary["name"],
+								"label": label,
+								"attack_status": probe_status,
+								"baseline_status": base_status,
+								"fp_axes": sorted(fp_diff),
+							})
 						found = True
 
 		if not found:
@@ -822,8 +876,16 @@ class ScanHeaderRemoval:
 		# from different points in time / different upstreams.
 		differing_pairs = 0
 		fp_only_pairs = 0
-		last_attack_req = None
 		last_fp_diff = set()
+		# Per-category snapshots so each finding's sidecars/meta describe the
+		# leg that actually triggered IT. The status/canary-flip category (dp_*)
+		# and the fp-only category (fp_*) are mutually exclusive per iteration
+		# (fp-only is the elif), so a shared snapshot could otherwise attach a
+		# status-matched pair to a "status differing" finding and vice-versa.
+		dp_attack_req = dp_attack_resp = dp_harmless_resp = None
+		dp_a_status = dp_h_status = None
+		fp_attack_req = fp_attack_resp = fp_harmless_resp = None
+		fp_a_status = fp_h_status = None
 		for attempt in range(5):
 			try:
 				web_h = _make_connection(self.host, self.port, self.ssl_flag, self.timeout, self.proxy)
@@ -853,31 +915,54 @@ class ScanHeaderRemoval:
 				# Primary signal: status code or canary-presence flip.
 				if h_status != a_status or h_has_canary != a_has_canary:
 					differing_pairs += 1
-					last_attack_req = attack_req
+					dp_attack_req = attack_req
+					dp_attack_resp = attack_resp
+					dp_harmless_resp = harmless_resp
+					dp_a_status = a_status
+					dp_h_status = h_status
 				# Secondary signal: status and canary both match, but
 				# the response structurally diverges across >=2 axes
 				# (catches Set-Cookie / Content-Length-only flips).
 				elif "status" in fp_diff or len(fp_diff) >= 2:
 					fp_only_pairs += 1
-					last_attack_req = attack_req
 					last_fp_diff = fp_diff
+					fp_attack_req = attack_req
+					fp_attack_resp = attack_resp
+					fp_harmless_resp = harmless_resp
+					fp_a_status = a_status
+					fp_h_status = h_status
 			except Exception:
 				continue
 
 		# Require >= 3/5 matched-pair differences before flagging, so a single
 		# network blip doesn't masquerade as a finding.
-		if differing_pairs >= 3 and last_attack_req:
+		if differing_pairs >= 3 and dp_attack_req:
 			print_fn("HdrRemoval", "Potential header removal vulnerability (Keep-Alive based, %d/5 differing pairs)" % differing_pairs)
 			raw = RawPayload()
-			raw.data = last_attack_req.encode('latin-1')
-			write_fn(self.host, raw, "HDRREMOVAL")
+			raw.data = dp_attack_req.encode('latin-1')
+			write_fn(self.host, raw, "HDRREMOVAL",
+				response=dp_attack_resp, baseline=dp_harmless_resp,
+				details={
+					"scan": "header-removal",
+					"label": "HDRREMOVAL",
+					"attack_status": dp_a_status,
+					"baseline_status": dp_h_status,
+				})
 			return True
-		if fp_only_pairs >= 3 and last_attack_req:
+		if fp_only_pairs >= 3 and fp_attack_req:
 			print_fn("HdrRemoval", "Subtle header removal vulnerability (Keep-Alive based, %d/5 fp-only pairs, axes: %s)" % (
 				fp_only_pairs, "+".join(sorted(last_fp_diff)) or "?"))
 			raw = RawPayload()
-			raw.data = last_attack_req.encode('latin-1')
-			write_fn(self.host, raw, "HDRREMOVAL_FP")
+			raw.data = fp_attack_req.encode('latin-1')
+			write_fn(self.host, raw, "HDRREMOVAL_FP",
+				response=fp_attack_resp, baseline=fp_harmless_resp,
+				details={
+					"scan": "header-removal",
+					"label": "HDRREMOVAL_FP",
+					"attack_status": fp_a_status,
+					"baseline_status": fp_h_status,
+					"fp_axes": sorted(last_fp_diff),
+				})
 			return True
 
 		print_fn("HdrRemoval", "No header removal vulnerability detected")
@@ -969,7 +1054,17 @@ class ScanExpectDesync:
 									variant_name, ",".join(annot), expect_header))
 								raw = RawPayload()
 								raw.data = req.encode('latin-1')
-								write_fn(self.host, raw, "EXPECT_%s" % variant_name)
+								write_fn(self.host, raw, "EXPECT_%s" % variant_name,
+									response=second_resp,
+									baseline=getattr(self, "_victim_baseline_raw", None),
+									details={
+										"scan": "expect",
+										"label": variant_name,
+										"attack_status": _get_status(second_resp),
+										"baseline_status": baseline_fp.status,
+										"fp_axes": sorted(_structural_diff(victim_fp, baseline_fp, noisy)),
+										"gadget_hit": gadget_hit,
+									})
 								found = True
 								break
 				except Exception:
@@ -1061,7 +1156,17 @@ class ScanTE0:
 							print_fn("TE.0", "Confirmed TE.0 desync [%s]" % ",".join(annot))
 							raw = RawPayload()
 							raw.data = req.encode('latin-1')
-							write_fn(self.host, raw, "TE0")
+							write_fn(self.host, raw, "TE0",
+								response=second_resp,
+								baseline=getattr(self, "_victim_baseline_raw", None),
+								details={
+									"scan": "te0",
+									"label": gadget_label,
+									"attack_status": _get_status(second_resp),
+									"baseline_status": baseline_fp.status,
+									"fp_axes": sorted(_structural_diff(victim_fp, baseline_fp, noisy)),
+									"gadget_hit": gadget_hit,
+								})
 							return True
 			except Exception:
 				continue
@@ -1153,7 +1258,17 @@ class ScanBareLFChunked:
 							print_fn("BareChunk", "Confirmed %s desync [%s]" % (variant_name, ",".join(annot)))
 							raw = RawPayload()
 							raw.data = req.encode('latin-1')
-							write_fn(self.host, raw, "BARECHUNK_%s" % terminator_kind.upper())
+							write_fn(self.host, raw, "BARECHUNK_%s" % terminator_kind.upper(),
+								response=second_resp,
+								baseline=getattr(self, "_victim_baseline_raw", None),
+								details={
+									"scan": "bare-lf",
+									"label": variant_name,
+									"attack_status": _get_status(second_resp),
+									"baseline_status": baseline_fp.status,
+									"fp_axes": sorted(_structural_diff(victim_fp, baseline_fp, noisy)),
+									"gadget_hit": gadget_hit,
+								})
 							return True
 			except Exception:
 				continue
@@ -1289,7 +1404,16 @@ class ScanHopByHop:
 					target, baseline_status, attack_status))
 				raw = RawPayload()
 				raw.data = (attack_req or "").encode('latin-1')
-				write_fn(self.host, raw, "HOPBYHOP_%s" % target.replace("-", ""))
+				write_fn(self.host, raw, "HOPBYHOP_%s" % target.replace("-", ""),
+					response=attack_resp, baseline=baseline_resps[0],
+					details={
+						"scan": "hop-by-hop",
+						"label": "strip:%s" % target,
+						"mutation": target,
+						"attack_status": attack_status,
+						"baseline_status": baseline_status,
+						"fp_axes": sorted(fp_diff),
+					})
 				found = True
 			elif repro_fp_only >= 2:
 				# Status didn't move but headers/body did, reproducibly.
@@ -1299,7 +1423,16 @@ class ScanHopByHop:
 					target, baseline_status, "+".join(sorted(fp_diff)) or "?"))
 				raw = RawPayload()
 				raw.data = (attack_req or "").encode('latin-1')
-				write_fn(self.host, raw, "HOPBYHOP_FP_%s" % target.replace("-", ""))
+				write_fn(self.host, raw, "HOPBYHOP_FP_%s" % target.replace("-", ""),
+					response=attack_resp, baseline=baseline_resps[0],
+					details={
+						"scan": "hop-by-hop",
+						"label": "strip-fp:%s" % target,
+						"mutation": target,
+						"attack_status": attack_status,
+						"baseline_status": baseline_status,
+						"fp_axes": sorted(fp_diff),
+					})
 				found = True
 
 		if not found:

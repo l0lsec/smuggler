@@ -440,7 +440,13 @@ class ScanH2Desync:
 						raw.data = ("# %s\n# %s\n# gadget=%s token=%r\n" % (
 							perm_name, desc, gadget["path"], gadget["token"]
 						)).encode('latin-1')
-						write_fn(self.host, raw, "H2_%s" % perm_name)
+						write_fn(self.host, raw, "H2_%s" % perm_name,
+							response=victim_resp, details={
+								"scan": "h2",
+								"label": perm_name,
+								"mutation": technique,
+								"gadget_hit": True,
+							})
 						found = True
 						break
 

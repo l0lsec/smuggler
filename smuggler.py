@@ -253,23 +253,69 @@ class Desyncr():
 
 	def _record_finding(self, ptype, host=None, payload_file=None, mutation=None,
 			status_label=None, gadget_hit=False, confidence=None, timing=None,
-			configfile=None):
+			configfile=None, scan=None, attack_status=None,
+			baseline_status=None, fp_axes=None, label=None):
 		"""Append a normalized finding record to the in-memory registry that
 		feeds --output-json / --output-sarif. Both scan paths call this; the
 		advanced path supplies only what it knows and leaves the rest null."""
 		self._findings.append({
 			"type": ptype,
+			"scan": scan,
 			"mutation": mutation,
 			"host": host,
 			"url": self._url,
 			"method": self._method,
 			"payload_file": payload_file,
 			"status_label": status_label,
+			"label": label,
+			"attack_status": attack_status,
+			"baseline_status": baseline_status,
+			"fp_axes": fp_axes,
 			"gadget_hit": bool(gadget_hit),
 			"confidence": confidence,
 			"timing_s": timing,
 			"configfile": configfile,
 		})
+
+	@staticmethod
+	def _resp_to_bytes(x):
+		"""Normalize a response/baseline (None | bytes | latin-1 str from
+		_filter_response) to bytes for sidecar storage. Scanner responses are
+		ASCII-flattened latin-1 strings, so latin-1 is a faithful 1:1 mapping."""
+		if x is None:
+			return b""
+		if isinstance(x, (bytes, bytearray)):
+			return bytes(x)
+		return str(x).encode('latin-1', errors='replace')
+
+	def _write_finding_artifacts(self, base, response=None, baseline=None, meta=None):
+		"""Write the response/baseline/meta sidecars next to a finding's request
+		.txt (which already lives at ``base + '.txt'``). Shared by the classic
+		``write_payload`` and the advanced ``adv_write`` paths so the GUI viewer
+		can surface what came back. Best-effort; never raises.
+
+		``<base>.response.txt`` is ALWAYS written (even empty) so the GUI can tell
+		"captured nothing back -- the hang is the signal" from "never recorded".
+		``<base>.baseline.txt`` is written only when a baseline is supplied.
+		"""
+		try:
+			with open(base + ".response.txt", 'wb') as f:
+				f.write(self._resp_to_bytes(response))
+		except OSError:
+			pass
+		if baseline is not None:
+			try:
+				with open(base + ".baseline.txt", 'wb') as f:
+					f.write(self._resp_to_bytes(baseline))
+			except OSError:
+				pass
+		if meta is not None:
+			try:
+				import json as _json
+				with open(base + ".meta.json", 'w') as f:
+					_json.dump(meta, f, indent=2)
+			except OSError:
+				pass
 
 	def _establish_persistent_connection(self):
 		"""Establish a persistent connection if enabled"""
@@ -463,18 +509,60 @@ class Desyncr():
 				self._logh.write(plaintext + "\n")
 				self._logh.flush()
 
-		def adv_write(smhost, payload, ptype):
+		def adv_write(smhost, payload, ptype, response=None, baseline=None,
+				details=None):
+			details = details or {}
 			scheme = "https" if self.ssl_flag else "http"
 			furl = "%s_%s" % (scheme, _safe_host_slug(smhost))
 			fname = os.path.join(_payloads_dir(), "%s_%s.txt" % (furl, ptype))
 			adv_print("CRITICAL", "%s Payload: %s URL: %s" % \
 				(Fore.MAGENTA + ptype, Fore.CYAN + fname + Fore.MAGENTA, Fore.CYAN + self._url))
+			if isinstance(payload, RawPayload):
+				req_bytes = payload.to_bytes()
+			else:
+				req_bytes = bytes(str(payload), 'utf-8')
 			with open(fname, 'wb') as file:
-				if isinstance(payload, RawPayload):
-					file.write(payload.to_bytes())
-				else:
-					file.write(bytes(str(payload), 'utf-8'))
-			self._record_finding(ptype, host=smhost, payload_file=fname)
+				file.write(req_bytes)
+
+			# Sidecars so the GUI viewer can show the attack response (and the
+			# baseline it was compared against) instead of "not captured".
+			import datetime as _dt
+			base = fname[:-4]
+			status_label = details.get("status_label") or "normal"
+			meta = {
+				"kind": ptype,
+				"scan": details.get("scan"),
+				"mutation": details.get("mutation"),
+				"url": self._url,
+				"method": self._method,
+				"configfile": None,
+				"confidence": details.get("confidence"),
+				"gadget_hit": bool(details.get("gadget_hit")),
+				"status_label": status_label,
+				"label": details.get("label"),
+				"attack_status": details.get("attack_status"),
+				"baseline_status": details.get("baseline_status"),
+				"fp_axes": details.get("fp_axes"),
+				"timing_s": details.get("timing_s"),
+				"request_bytes": len(req_bytes),
+				"response_bytes": len(self._resp_to_bytes(response)),
+				"baseline_bytes": (len(self._resp_to_bytes(baseline))
+					if baseline is not None else None),
+				"timestamp": _dt.datetime.utcnow().isoformat() + "Z",
+			}
+			self._write_finding_artifacts(base, response=response,
+				baseline=baseline, meta=meta)
+
+			self._record_finding(
+				ptype, host=smhost, payload_file=fname,
+				scan=details.get("scan"), mutation=details.get("mutation"),
+				status_label=status_label, label=details.get("label"),
+				attack_status=details.get("attack_status"),
+				baseline_status=details.get("baseline_status"),
+				fp_axes=details.get("fp_axes"),
+				gadget_hit=bool(details.get("gadget_hit")),
+				confidence=details.get("confidence"),
+				timing=details.get("timing_s"))
 
 		if not self._get_cookies():
 			return
@@ -820,50 +908,31 @@ class Desyncr():
 				file.write(bytes(str(payload),'utf-8'))
 
 			# ---- Sidecars for the web GUI's View dialog -------------------
-			# The .txt above is only the REQUEST bytes. Without these
-			# sidecars the GUI has no way to surface what came back, the
-			# timing window, or whether the gadget oracle fired.
-			#
-			# We ALWAYS write .response.txt — even when response is None or
-			# empty — so the GUI can distinguish "smuggler captured nothing
-			# back (the hang IS the desync signal)" from "we never recorded
-			# this run". The status_label in .meta.json tells the GUI which
-			# interpretation applies (timeout / disconnect / error / normal).
+			# The .txt above is only the REQUEST bytes. The sidecars (written by
+			# the shared _write_finding_artifacts helper) let the GUI surface
+			# what came back, the timing window, and whether the gadget fired.
+			# The status_label tells the GUI how to interpret an empty response
+			# (timeout / disconnect / error / normal).
+			import datetime as _dt
 			base = fname[:-4]  # strip ".txt"
-			try:
-				if response is None:
-					resp_bytes = b""
-				elif isinstance(response, (bytes, bytearray)):
-					resp_bytes = bytes(response)
-				else:
-					resp_bytes = str(response).encode('utf-8', errors='replace')
-				with open(base + ".response.txt", 'wb') as f:
-					f.write(resp_bytes)
-			except OSError:
-				pass
-			try:
-				import json as _json, datetime as _dt
-				status_label = {0: "normal", 1: "timeout",
-					2: "disconnect", -1: "error"}.get(status_code, "unknown")
-				meta = {
-					"kind": ptype,
-					"mutation": name,
-					"url": self._url,
-					"method": self._method,
-					"configfile": self._configfile.split('/')[-1],
-					"confidence": confidence,
-					"gadget_hit": bool(gadget_hit),
-					"status_code": status_code,
-					"status_label": status_label,
-					"timing_s": round(timing, 3) if timing is not None else None,
-					"request_bytes": len(str(payload).encode('utf-8', errors='replace')),
-					"response_bytes": len(response) if response else 0,
-					"timestamp": _dt.datetime.utcnow().isoformat() + "Z",
-				}
-				with open(base + ".meta.json", 'w') as f:
-					_json.dump(meta, f, indent=2)
-			except OSError:
-				pass
+			status_label = {0: "normal", 1: "timeout",
+				2: "disconnect", -1: "error"}.get(status_code, "unknown")
+			meta = {
+				"kind": ptype,
+				"mutation": name,
+				"url": self._url,
+				"method": self._method,
+				"configfile": self._configfile.split('/')[-1],
+				"confidence": confidence,
+				"gadget_hit": bool(gadget_hit),
+				"status_code": status_code,
+				"status_label": status_label,
+				"timing_s": round(timing, 3) if timing is not None else None,
+				"request_bytes": len(str(payload).encode('utf-8', errors='replace')),
+				"response_bytes": len(self._resp_to_bytes(response)),
+				"timestamp": _dt.datetime.utcnow().isoformat() + "Z",
+			}
+			self._write_finding_artifacts(base, response=response, meta=meta)
 
 			self._record_finding(
 				ptype, host=smhost, payload_file=fname, mutation=name,
