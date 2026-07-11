@@ -1,5 +1,5 @@
 import random
-from lib.Payload import RawPayload
+from lib.Payload import RawPayload, cache_bust
 from lib.EasySSL import EasyH2, EasySSL, H2_AVAILABLE
 
 
@@ -128,9 +128,9 @@ class ScanH2Desync:
 				web.connect(self.host, self.port, self.timeout, self.proxy)
 				cb = str(random.random()).split('.')[1]
 				probe_req = (
-					"GET %s?cb=%s HTTP/1.1\r\nHost: %s\r\n"
+					"GET %s HTTP/1.1\r\nHost: %s\r\n"
 					"User-Agent: smuggler\r\nConnection: close\r\n\r\n"
-					% (gadget["path"], cb, self.vhost)
+					% (cache_bust(gadget["path"], cb), self.vhost)
 				)
 				web.send(probe_req.encode())
 				gadget_resp = _filter_bytes(web.recv_all(self.timeout))
@@ -143,9 +143,9 @@ class ScanH2Desync:
 				web2.connect(self.host, self.port, self.timeout, self.proxy)
 				cb2 = str(random.random()).split('.')[1]
 				base_req = (
-					"GET %s?cb=%s HTTP/1.1\r\nHost: %s\r\n"
+					"GET %s HTTP/1.1\r\nHost: %s\r\n"
 					"User-Agent: smuggler\r\nConnection: close\r\n\r\n"
-					% (self.endpoint, cb2, self.vhost)
+					% (cache_bust(self.endpoint, cb2), self.vhost)
 				)
 				web2.send(base_req.encode())
 				base_resp = _filter_bytes(web2.recv_all(self.timeout))
@@ -166,9 +166,9 @@ class ScanH2Desync:
 			web.connect(self.host, self.port, self.timeout, self.proxy)
 			cb = str(random.random()).split('.')[1]
 			req = (
-				"GET %s?cb=%s HTTP/1.1\r\nHost: %s\r\n"
+				"GET %s HTTP/1.1\r\nHost: %s\r\n"
 				"User-Agent: smuggler\r\nConnection: close\r\n\r\n"
-				% (self.endpoint, cb, self.vhost)
+				% (cache_bust(self.endpoint, cb), self.vhost)
 			)
 			web.send(req.encode())
 			res = web.recv_all(self.timeout)
@@ -180,7 +180,7 @@ class ScanH2Desync:
 	def _probe(self, technique, gadget):
 		smuggled = "GET %s HTTP/1.1\r\nHost: %s\r\nFoo: bar" % (gadget["path"], self.vhost)
 		cb = str(random.random()).split('.')[1]
-		path = "%s?cb=%s" % (self.endpoint, cb)
+		path = cache_bust(self.endpoint, cb)
 
 		# Extra header tuples appended to every permutation's header list:
 		# cookies plus the user's custom request headers (Authorization, X-Dtc,

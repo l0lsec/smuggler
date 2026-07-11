@@ -25,6 +25,19 @@ import re
 
 RN = "\r\n"
 EndChunk = "0\r\n\r\n"
+
+def cache_bust_sep(endpoint):
+	"""Return the query separator to use when appending a cache-busting
+	parameter to `endpoint`: '?' when the endpoint has no query string yet,
+	'&' when it already contains one (so we don't emit a second '?')."""
+	return '&' if '?' in endpoint else '?'
+
+def cache_bust(endpoint, cb, name="cb"):
+	"""Append a cache-busting `name=cb` parameter to `endpoint`, choosing the
+	correct separator so an endpoint that already carries query parameters
+	gets '&name=...' instead of a malformed second '?name=...'."""
+	return "%s%s%s=%s" % (endpoint, cache_bust_sep(endpoint), name, cb)
+
 def Chunked(data):
 	return hex(len(data))[2:]+RN+data+RN
 
@@ -87,6 +100,11 @@ class Payload():
 			result = re.sub("__REPLACE_CL__",str(self.cl),result)
 			
 		result = re.sub("__METHOD__",self.method,result)
+		# Templates hardcode the cache-buster as `__ENDPOINT__?cb=...`. When the
+		# endpoint already carries a query string, rewrite that literal '?' to
+		# '&' so we don't produce a malformed request line with two '?'.
+		if '?' in self.endpoint:
+			result = result.replace("__ENDPOINT__?cb=", "__ENDPOINT__&cb=")
 		result = re.sub("__ENDPOINT__",self.endpoint,result)
 		result = re.sub("__HOST__",self.host,result)
 			

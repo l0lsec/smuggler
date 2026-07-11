@@ -34,7 +34,7 @@ import threading
 from copy import deepcopy
 from time import sleep
 from datetime import datetime
-from lib.Payload import Payload, Chunked, EndChunk, RawPayload
+from lib.Payload import Payload, Chunked, EndChunk, RawPayload, cache_bust
 from lib.EasySSL import EasySSL
 from lib.colorama import Fore, Style
 from lib.Scans import (
@@ -818,8 +818,9 @@ class Desyncr():
 		else:
 			return empty
 
-		victim = "GET %s?vcb=%d HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % (
-			self._endpoint, random.randint(1, 1 << 30), self._vhost or self._host
+		victim = "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % (
+			cache_bust(self._endpoint, random.randint(1, 1 << 30), name="vcb"),
+			self._vhost or self._host
 		)
 
 		try:
@@ -1518,21 +1519,74 @@ def _confirm_payload_kind(payload_path):
 	return stem[-2] if len(stem) >= 3 else "?"
 
 
+def _strip_cache_buster(path):
+	"""Drop the cache-buster (cb=/vcb=) parameter we bake into saved request
+	lines so a recovered endpoint starts clean."""
+	if "?" not in path:
+		return path
+	head, _, query = path.partition("?")
+	kept = [tok for tok in query.split("&")
+		if tok and not tok.startswith(("cb=", "vcb="))]
+	return head + ("?" + "&".join(kept) if kept else "")
+
+
+def _target_from_request_file(payload_path):
+	"""Recover (url, method) from a finding's saved request bytes when no
+	.meta.json url is available. The request line yields the method and
+	endpoint, the first Host header yields the authority, and the scheme is
+	read from the payload filename prefix (adv_write names files
+	'<scheme>_<host>_...'). Returns None if the file can't be parsed into a
+	usable target."""
+	try:
+		with open(payload_path, "rb") as f:
+			raw = f.read()
+	except OSError:
+		return None
+	lines = raw.decode("latin-1", errors="replace").replace("\r\n", "\n").split("\n")
+	request_line = next((ln for ln in lines if ln.strip()), "")
+	parts = request_line.split(" ")
+	if len(parts) < 2 or not parts[1].startswith("/"):
+		return None
+	method, path = parts[0], _strip_cache_buster(parts[1])
+	# The first Host header holds the real authority; later duplicate Host
+	# lines are part of the smuggling mutation itself.
+	host = None
+	for ln in lines[1:]:
+		if ln.strip() == "":
+			break  # end of headers
+		if ln.lower().startswith("host:"):
+			host = ln.split(":", 1)[1].strip()
+			break
+	if not host:
+		return None
+	scheme = "http" if os.path.basename(payload_path).startswith("http_") else "https"
+	return "%s://%s%s" % (scheme, host, path), method
+
+
 def _derive_confirm_target(payload_path, args):
 	"""Resolve (host, port, endpoint, ssl_flag, method) for a confirmation
-	run, preferring the payload's .meta.json url, then -u/--url."""
+	run, preferring the payload's .meta.json url, then -u/--url, and finally
+	falling back to the target recovered from the saved request bytes (so a
+	finding with a missing/urlless sidecar is still confirmable)."""
 	base = payload_path[:-4] if payload_path.endswith(".txt") else payload_path
 	url = None
-	method = "POST"
+	meta_method = None
 	try:
 		import json as _json
 		meta = _json.loads(open(base + ".meta.json", encoding="utf-8").read())
 		url = meta.get("url")
-		method = meta.get("method") or method
+		meta_method = meta.get("method")
 	except (OSError, ValueError):
 		pass
+	method = meta_method or "POST"
 	if not url:
 		url = args.url
+	if not url:
+		recovered = _target_from_request_file(payload_path)
+		if recovered:
+			url, req_method = recovered
+			if not meta_method and req_method:
+				method = req_method
 	if not url:
 		return None
 	host, port, endpoint, ssl_flag = process_uri(url)
@@ -1577,7 +1631,7 @@ def run_confirmation(args):
 
 	target = _derive_confirm_target(payload, args)
 	if not target:
-		print_info("Error: cannot determine target. The payload has no .meta.json url; pass -u/--url.")
+		print_info("Error: cannot determine target from the .meta.json url or the saved request; pass -u/--url.")
 		return 2
 	host, port, endpoint, ssl_flag, method = target
 

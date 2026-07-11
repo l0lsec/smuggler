@@ -7,6 +7,7 @@ from datetime import datetime
 from lib.Payload import (
 	Payload, Chunked, EndChunk, RawPayload,
 	ChunkedExt, EndChunkExt, EndChunkBareLF, ChunkedBareLF, EndChunkBareCR, RN,
+	cache_bust,
 )
 from lib.EasySSL import EasySSL
 from lib.Fingerprint import Fingerprint, baseline_fingerprint
@@ -205,7 +206,7 @@ def _inject_extra_headers(raw, extra_headers):
 
 def _build_raw_request(method, endpoint, host, headers=None, body="", http_version="1.1", extra_headers=None):
 	cb = str(random.random()).split('.')[1]
-	req = "%s %s?cb=%s HTTP/%s\r\n" % (method, endpoint, cb, http_version)
+	req = "%s %s HTTP/%s\r\n" % (method, cache_bust(endpoint, cb), http_version)
 	req += "Host: %s\r\n" % host
 	req += "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.6723.44 Safari/537.36\r\n"
 	req += "Content-Type: application/x-www-form-urlencoded\r\n"
@@ -315,7 +316,7 @@ class ScanCL0:
 			inner_method = og.method if og is not None else "GET"
 			smuggled_prefix = "%s %s HTTP/1.1\r\nX-Ignore: " % (inner_method, path)
 		cb = str(random.random()).split('.')[1]
-		req = "%s %s?cb=%s HTTP/1.1\r\n" % (method, self.endpoint, cb)
+		req = "%s %s HTTP/1.1\r\n" % (method, cache_bust(self.endpoint, cb))
 		req += "Host: %s\r\n" % self.vhost
 		req += "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.6723.44 Safari/537.36\r\n"
 		req += "Content-Type: application/x-www-form-urlencoded\r\n"
@@ -461,7 +462,7 @@ class ScanPauseDesync:
 				web = _make_connection(self.host, self.port, self.ssl_flag, max(self.timeout, self.pause_timeout + 10), self.proxy)
 
 				cb = str(random.random()).split('.')[1]
-				headers_part = "%s %s?cb=%s HTTP/1.1\r\n" % (self.method, self.endpoint, cb)
+				headers_part = "%s %s HTTP/1.1\r\n" % (self.method, cache_bust(self.endpoint, cb))
 				headers_part += "Host: %s\r\n" % self.vhost
 				headers_part += "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.6723.44 Safari/537.36\r\n"
 				headers_part += "Content-Type: application/x-www-form-urlencoded\r\n"
@@ -714,7 +715,7 @@ class ScanParserDiscrepancy:
 
 		def _make_probe(hidden_header):
 			cb = str(random.random()).split('.')[1]
-			req = "%s %s?cb=%s HTTP/1.1\r\n" % (self.method, self.endpoint, cb)
+			req = "%s %s HTTP/1.1\r\n" % (self.method, cache_bust(self.endpoint, cb))
 			req += "Host: %s\r\n" % self.vhost
 			req += "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.6723.44 Safari/537.36\r\n"
 			req += "Content-Type: application/x-www-form-urlencoded\r\n"
@@ -855,7 +856,7 @@ class ScanHeaderRemoval:
 
 		body = "Host: " + canary
 		cb = str(random.random()).split('.')[1]
-		attack_req = "POST %s?cb=%s HTTP/1.1\r\n" % (self.endpoint, cb)
+		attack_req = "POST %s HTTP/1.1\r\n" % cache_bust(self.endpoint, cb)
 		attack_req += "Host: %s\r\n" % self.vhost
 		attack_req += "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.6723.44 Safari/537.36\r\n"
 		attack_req += "Content-Type: application/x-www-form-urlencoded\r\n"
@@ -1012,7 +1013,7 @@ class ScanExpectDesync:
 		found = False
 		for variant_name, expect_header in expect_variants:
 			cb = str(random.random()).split('.')[1]
-			req = "%s %s?cb=%s HTTP/1.1\r\n" % (self.method, self.endpoint, cb)
+			req = "%s %s HTTP/1.1\r\n" % (self.method, cache_bust(self.endpoint, cb))
 			req += "Host: %s\r\n" % self.vhost
 			req += "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.6723.44 Safari/537.36\r\n"
 			req += "Content-Type: application/x-www-form-urlencoded\r\n"
@@ -1118,7 +1119,7 @@ class ScanTE0:
 		for attempt in range(5):
 			try:
 				cb = str(random.random()).split('.')[1]
-				req = "%s %s?cb=%s HTTP/1.1\r\n" % (self.method, self.endpoint, cb)
+				req = "%s %s HTTP/1.1\r\n" % (self.method, cache_bust(self.endpoint, cb))
 				req += "Host: %s\r\n" % self.vhost
 				req += "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.6723.44 Safari/537.36\r\n"
 				req += "Content-Type: application/x-www-form-urlencoded\r\n"
@@ -1220,7 +1221,7 @@ class ScanBareLFChunked:
 		for attempt in range(5):
 			try:
 				cb = str(random.random()).split('.')[1]
-				req = "%s %s?cb=%s HTTP/1.1\r\n" % (self.method, self.endpoint, cb)
+				req = "%s %s HTTP/1.1\r\n" % (self.method, cache_bust(self.endpoint, cb))
 				req += "Host: %s\r\n" % self.vhost
 				req += "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.6723.44 Safari/537.36\r\n"
 				req += "Content-Type: application/x-www-form-urlencoded\r\n"
@@ -1330,7 +1331,7 @@ class ScanHopByHop:
 		try:
 			web = _make_connection(self.host, self.port, self.ssl_flag, self.timeout, self.proxy)
 			cb = str(random.random()).split('.')[1]
-			req = "GET %s?cb=%s HTTP/1.1\r\n" % (self.endpoint, cb)
+			req = "GET %s HTTP/1.1\r\n" % cache_bust(self.endpoint, cb)
 			req += "Host: %s\r\n" % self.vhost
 			req += "User-Agent: smuggler\r\n"
 			if self.cookies:
